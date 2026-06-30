@@ -58,8 +58,8 @@ GPU = 0
 DEVICE = f"cuda:{GPU}"
 
 
-movienet_dataset_path = "/mnt/MovieNet/"
-kinetics_dataset_path = "/root/autodl-tmp/Kinetics/"
+movienet_dataset_path = "data/MovieNet/"
+kinetics_dataset_path = "data/Kinetics/"
 IMG_PATH         = movienet_dataset_path + 'ImageNet_shot.pkl'
 PLC_PATH         = movienet_dataset_path + 'Places_shot.pkl'
 LABEL_PATH       = movienet_dataset_path + 'label_endShot.pkl'
@@ -67,8 +67,8 @@ SPLIT_PATH_SCENE = movienet_dataset_path + 'split318.json'
 MAMBA_PATH       = IMG_PATH
 
 # 输出目录
-ck_path = "/root/autodl-fs/"
-CKPT_DIR = ck_path + 'mamba/checkpoint_event_first/EventFirst_WithCL_AdvOnly'
+ck_path = "<weight>"
+CKPT_DIR = ck_path + '<checkpoint.pt>'
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # Stage 2 蒸馏 + 对抗超参

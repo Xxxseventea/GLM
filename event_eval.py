@@ -170,19 +170,19 @@ def main():
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        default="/data/dengyunhui/txx_code/work2/PC/event/ckpt_best.pth",
+        default="<weights/ckpt_best.pth>",
         help="Path to checkpoint file",
     )
     parser.add_argument(
         "--feature_path",
         type=str,
-        default="/data/shared_dataset/Kinetics/features",
+        default="</data/Kinetics/features>",
         help="Path to features directory",
     )
     parser.add_argument(
         "--anno_path",
         type=str,
-        default="/data/shared_dataset/Kinetics/data",
+        default="</data/Kinetics/data>",
         help="Path to annotation directory",
     )
     parser.add_argument(

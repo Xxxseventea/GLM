@@ -19,14 +19,12 @@ T = 21
 GPU = 6
 
 # 路径
-IMG_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl'
-PLC_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl'
-LABEL_PATH = '/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl'
-SPLIT_PATH = '/home/tianxiaoxuan/data/mamba/data/split318.json'
-MAMBA_PATH = '/home/tianxiaoxuan/data/mamba/data/ImageNet_shot.pkl'
+IMG_PATH = '<data/MovieNet/ImageNet_shot.pkl>'
+PLC_PATH = '<data/MovieNet/Places_shot.pkl>'
+LABEL_PATH = '<data/MovieNet/label_endShot.pkl>'
+SPLIT_PATH = '<data/MovieNet/split318.json>'
+CKPT_DIR = '<weight/best_checkpoint.pt>'
 
-CKPT_DIR = '/home/tianxiaoxuan/data/mamba/checkpoint_scene'
-SIDE_DIR = '/home/tianxiaoxuan/data/mamba/side_outputs'
 os.makedirs(CKPT_DIR, exist_ok=True)
 os.makedirs(SIDE_DIR, exist_ok=True)
 import torch
@@ -60,7 +58,7 @@ def train_epoch(trainload, model, opti, lr_sh, gpu=GPU):
     return 1
 
 
-def test_epoch(testload, model, gpu=GPU, side_save_path=None):
+def test_epoch(testload, model, gpu=GPU):
     predlist, labelist, pathlist, idlist = [], [], [],[]
     side_rel_feat = []
 
@@ -83,19 +81,6 @@ def test_epoch(testload, model, gpu=GPU, side_save_path=None):
 
 
     met, moviePL = metric(pathlist, predlist, labelist)
-
-    if side_save_path is not None:
-        labels_arr = np.concatenate(labelist)
-        probs_arr = np.concatenate(predlist)
-        ids_arr = np.concatenate(idlist)  # -> ndarray
-        rel_feat_arr = np.concatenate(side_rel_feat) if len(side_rel_feat) else np.array([])
-        paths = [p for batch_names in pathlist for p in batch_names]
-        np.savez(side_save_path,
-                 labels=labels_arr.astype(np.float32),
-                 probs=probs_arr.astype(np.float32),
-                 rel_feat=rel_feat_arr.astype(np.float32),
-                 paths=np.array(paths),
-                 ids=ids_arr.astype(np.int64))
     return met, moviePL
 def main():
     # model = CombinedModel().to(f'cuda:{GPU}')
@@ -159,8 +144,7 @@ def main():
         }
         torch.save(ckpt, ckpt_path)
 
-        side_path = os.path.join(SIDE_DIR, f'epoch_{i:03d}.npz')
-        met, moviePL = test_epoch(testload=test_dataLoader, model=model, gpu=GPU, side_save_path=side_path)
+        met, moviePL = test_epoch(testload=test_dataLoader, model=model, gpu=GPU)
         print(met)
 
 

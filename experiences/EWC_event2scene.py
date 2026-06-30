@@ -328,18 +328,18 @@ class CFG:
     LAMBDA = 1e6                 # 参考代码默认 1_000_000
     LR = 1e-4
 
-    movienet_dataset_path = "/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/"
-    kinetics_dataset_path = "/data/shared_dataset/Kinetics/"
+    movienet_dataset_path = "data/MovieNet/"
+    kinetics_dataset_path = "data/Kinetics/"
     FEATURE_PATH = kinetics_dataset_path + "features"
     SCORE_PATH =  kinetics_dataset_path + "data"
     ANNOTATION_PATH = kinetics_dataset_path +  "data"
     IMG_PATH = movienet_dataset_path + "ImageNet_shot.pkl"
     PLC_PATH = movienet_dataset_path + "Places_shot.pkl"
-    LABEL_PATH = "/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl"
+    LABEL_PATH = "data/MovieNet/label_endShot.pkl"
 
-    SPLIT_PATH = "/home/tianxiaoxuan/data/mamba/data/split318.json"
+    SPLIT_PATH = "data/MovieNet/split318.json"
 
-    OUT = "/home/tianxiaoxuan/data/mamba/checkpoint_scene2event_ewc"
+    OUT = "<output_dir>"
 
 
 # ============================================================

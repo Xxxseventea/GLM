@@ -273,19 +273,19 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device index (default: 0)')
     parser.add_argument('--movienet_path', type=str,
-                        default="/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet",
+                        default="<MovieNet_path>",
                         help='Path to MovieNet dataset')
     parser.add_argument('--img_path', type=str,
-                        default="/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl",
+                        default="<MovieNet/ImageNet_shot.pkl>",
                         help='Path to image context features')
     parser.add_argument('--plc_path', type=str,
-                        default="/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl",
+                        default="<MovieNet/Places_shot.pkl>",
                         help='Path to place context features')
     parser.add_argument('--label_path', type=str,
-                        default="/data/dengyunhui/txx_code/work2/data/label_endShot.pkl",
+                        default="<MovieNet/label_endShot.pkl>",
                         help='Path to labels')
     parser.add_argument('--split_path', type=str,
-                        default="/data/dengyunhui/txx_code/work2/data/split318.json",
+                        default="<MovieNet/split318.json>",
                         help='Path to train/test split')
     parser.add_argument('--window_size', type=int, default=21,
                         help='Window size for temporal context (default: 21)')

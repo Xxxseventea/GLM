@@ -1,6 +1,23 @@
+"""
+Event-First 三阶段独立训练脚本 (event → scene → event)，
+镜像原 SceneFirst_WithCL_AdvOnly 的完整 SchemeA：
+    KD (特征蒸馏) + GRL 对抗 + 每 step 更新一次全局 Disc
+
+用法：
+    python train_3stages_event_first.py --stage 1   # Event-Only (from scratch)
+    python train_3stages_event_first.py --stage 2   # Scene + Event-Teacher KD + Adv
+    python train_3stages_event_first.py --stage 3   # 冻结 backbone + 新 FrameWiseHead
+
+每阶段一个独立进程，结束即退出，OS 回收 RAM / 显存 / DataLoader workers。
+阶段间通过磁盘 ckpt 衔接：
+    Stage 1 -> CKPT_DIR/event_only_best.pth
+    Stage 2 -> CKPT_DIR/scene_with_event_teacher_best.pth
+    Stage 3 -> CKPT_DIR/event_head_best.pth
+"""
 
 import argparse
 import os
+import sys
 from typing import Optional, Tuple
 from collections import defaultdict
 import torch
@@ -17,7 +34,7 @@ from model.backbone.RelationNet import LocalUncertaintyAwareGraphAttentionLite
 from model.detector.scene_detector import MlpHead
 from model.detector.event_detector import FrameWiseHead
 from model.discriminator.discriminator import TemporalDiscriminator
-from dataset.movienet.load_movienet_server import load_data
+from dataset.movienet.load_movienet_server2 import load_data
 from dataset.kinetics.dataset import build as build_kinetics, collate_fn
 from tool.warmup_lr import warmup_decay_cosine
 from tool.metric.scene_metric import metric
@@ -26,15 +43,15 @@ from tool.metric.kinetics_metric import (
     eval_by_frame_metric_from_seconds_map,
     summarize_global_avg_over_thresholds,
 )
-from teacher_head import build_teacher_event_detector
 # =================================================
 
 
 # =========================
 # Config
 # =========================
-EPOCHS = 5
-STAGE_3_EPOCHS = 20
+EVENT_PRETRAIN_EPOCHS = 5    # Stage 1: event 从零
+SCENE_TRAIN_EPOCHS    = 5    # Stage 2: scene + event teacher KD + adv
+EVENT_HEAD_EPOCHS     = 20   # Stage 3: 冻结 backbone, 新 FrameWiseHead
 BATCH_SIZE = 128
 T = 21
 GPU = 0
@@ -43,32 +60,35 @@ DEVICE = f"cuda:{GPU}"
 
 movienet_dataset_path = "/mnt/MovieNet/"
 kinetics_dataset_path = "/root/autodl-tmp/Kinetics/"
-# 场景数据路径（新域）
-IMG_PATH = movienet_dataset_path + 'ImageNet_shot.pkl'
-PLC_PATH = movienet_dataset_path + 'Places_shot.pkl'
-LABEL_PATH = movienet_dataset_path + 'label_endShot.pkl'
+IMG_PATH         = movienet_dataset_path + 'ImageNet_shot.pkl'
+PLC_PATH         = movienet_dataset_path + 'Places_shot.pkl'
+LABEL_PATH       = movienet_dataset_path + 'label_endShot.pkl'
 SPLIT_PATH_SCENE = movienet_dataset_path + 'split318.json'
-MAMBA_PATH = IMG_PATH
-
-# 第一任务（事件）checkpoint：用于加载教师 encoder 权重
-ck_path = "/root/autodl-tmp/txx_code/"
-CKPT_EVENT = ck_path + "checkpoint_event/ckpt_ep0.pth"
+MAMBA_PATH       = IMG_PATH
 
 # 输出目录
-CKPT_DIR = ck_path + 'mamba/checkpoint_event/WithCL_AdvOnly'
+ck_path = "/root/autodl-fs/"
+CKPT_DIR = ck_path + 'mamba/checkpoint_event_first/EventFirst_WithCL_AdvOnly'
 os.makedirs(CKPT_DIR, exist_ok=True)
 
-# 方案A超参
-ALPHA_FEAT = 0.5   # 特征蒸馏权重
-LAMBDA_ADV = 0.1   # 域对抗权重
-SCENE_KEEP_RATIO = 1.0  # 场景抽样比例
-EVENT_KEEP_RATIO = 0.30  # 事件抽样比例
-USE_PROJ_TO_TEACHER = False  # 若教师/学生 z 维度不一致，设为 True
+# Stage 2 蒸馏 + 对抗超参
+ALPHA_FEAT       = 0.5
+LAMBDA_ADV       = 0.1
+EVENT_KEEP_RATIO = 1.0    # Stage 1 主任务: 事件抽样比例
+SCENE_KEEP_RATIO = 1.0    # Stage 2 主任务: 场景抽样比例
+EVENT_AUX_RATIO  = 0.30   # Stage 2 辅助: 事件仅供域对抗
+USE_PROJ_TO_TEACHER = False
 
+# 三阶段 ckpt 衔接路径
+EVENT_ONLY_BEST_PATH               = os.path.join(CKPT_DIR, "event_only_best.pth")
+SCENE_WITH_EVENT_TEACHER_BEST_PATH = os.path.join(CKPT_DIR, "scene_with_event_teacher_best.pth")
+EVENT_HEAD_BEST_PATH               = os.path.join(CKPT_DIR, "event_head_best.pth")
+
+
+# =========================
+# 工具函数
+# =========================
 def to_serializable(obj):
-    """
-    递归把 numpy / torch / 标量等转成可写入 json 的类型
-    """
     if isinstance(obj, dict):
         return {str(k): to_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
@@ -94,14 +114,8 @@ def save_json(data, json_path):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(to_serializable(data), f, ensure_ascii=False, indent=2)
 
+
 def build_center_reg_labels_from_relative_targets(targets_list):
-    """
-    从你当前 dataset 的 targets（包含 'boundaries' in [0,1]）构造 K=1 的监督：
-    - cls_label: (B,) 0/1，窗口内是否存在至少一个 GT 边界
-    - center_gt: (B,) ∈ [0,1]，若存在多个 GT，选离 0.5 最近的一个作为该窗的监督目标
-    - has_pos:   (B,) bool，正样本掩码
-    - vid_ids:   list[str]，用于汇总时写 submission
-    """
     B = len(targets_list)
     device = (targets_list[0]['boundaries'].device
               if torch.is_tensor(targets_list[0]['boundaries'])
@@ -109,8 +123,8 @@ def build_center_reg_labels_from_relative_targets(targets_list):
 
     cls_label = torch.zeros(B, dtype=torch.float32, device=device)
     center_gt = torch.full((B,), 0.5, dtype=torch.float32, device=device)
-    has_pos = torch.zeros(B, dtype=torch.bool, device=device)
-    vid_ids = []
+    has_pos   = torch.zeros(B, dtype=torch.bool, device=device)
+    vid_ids   = []
 
     for i, t in enumerate(targets_list):
         vid_tensor = t.get('video_id', None)
@@ -129,9 +143,6 @@ def build_center_reg_labels_from_relative_targets(targets_list):
     return cls_label, center_gt, has_pos, vid_ids
 
 
-# =========================
-# Utils: load backbone-only
-# =========================
 def extract_state_dict(ckpt):
     if isinstance(ckpt, dict):
         if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
@@ -160,13 +171,17 @@ def load_backbone_only(model: nn.Module, ckpt_path: str, detector_prefix: str = 
     return load_info
 
 
+def require_ckpt(path: str, stage_name: str):
+    if not os.path.isfile(path):
+        print(f"[ERROR] Stage {stage_name} requires checkpoint: {path}")
+        print(f"        请先运行更早阶段, 确认产生该文件后再继续。")
+        sys.exit(1)
+
+
 # =========================
-# Hook方式获取 encoder 的 pre-head 表征 z
+# Hook
 # =========================
 class EncoderPreHook:
-    """
-    使用 detector.forward_pre_hook 捕获传入 detector 的特征 z。
-    """
     def __init__(self, model_with_head: nn.Module):
         self.z = None
         def pre_hook(module, inputs):
@@ -175,89 +190,14 @@ class EncoderPreHook:
         self.h = model_with_head.detector.register_forward_pre_hook(lambda m, inp: pre_hook(m, inp))
 
     def close(self):
-        self.h.remove()
-
-
-
-@torch.no_grad()
-def eval_event_with_external_detector(
-    encoder_model: nn.Module,
-    external_detector: nn.Module,
-    testload,
-    gpu=0,
-):
-    """
-    用 encoder_model 的 encoder + external_detector 做事件验证。
-    会临时替换 detector，验证后恢复原 detector。
-    """
-    old_detector = encoder_model.detector
-    encoder_model.detector = external_detector
-    try:
-        results = test_epoch_event(testload, encoder_model, gpu=gpu)
-    finally:
-        encoder_model.detector = old_detector
-    return results
-
-# =========================
-# Build student/teacher
-# =========================
-def build_student(
-    device: str = DEVICE,
-    dim_in: int = 2048,
-    num_heads: int = 8,
-    window_size: int = 5,
-    size: int = 21,
-    mlp_hid_dim: int = 512,
-    mlp_out_dim: int = 1,
-) -> Tuple[nn.Module, EncoderPreHook, int]:
-    student = LocalUncertaintyAwareGraphAttentionLite(
-        dim_in=dim_in,
-        num_heads=num_heads,
-        window_size=window_size,
-        sim_temperature=0.07,
-        neighbor_temp=0.5,
-        uncertainty_mode="variance",
-        use_relative_pos_bias=True,
-        norm="ln",
-        size=size,
-    ).to(device)
-    student.detector = MlpHead(in_dim=2176, hid_dim=mlp_hid_dim, out_dim=mlp_out_dim).to(device)
-    hook = EncoderPreHook(student)
-    z_dim = 2176
-    return student, hook, z_dim
-
-
-def build_teacher_encoder(
-    ckpt_path: str,
-    device: str = DEVICE,
-    dim_in: int = 2048,
-    num_heads: int = 8,
-    window_size: int = 5,
-    size: int = 21,
-) -> Tuple[nn.Module, EncoderPreHook, int]:
-    teacher = LocalUncertaintyAwareGraphAttentionLite(
-        dim_in=dim_in,
-        num_heads=num_heads,
-        window_size=window_size,
-        sim_temperature=0.07,
-        neighbor_temp=0.5,
-        uncertainty_mode="variance",
-        use_relative_pos_bias=True,
-        norm="ln",
-        size=size,
-    ).to(device)
-    load_backbone_only(teacher, ckpt_path, detector_prefix="detector.")
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    teacher.eval()
-    teacher.detector = nn.Identity().to(device)
-    hook = EncoderPreHook(teacher)
-    z_dim = 2176
-    return teacher, hook, z_dim
+        try:
+            self.h.remove()
+        except Exception:
+            pass
 
 
 # =========================
-# GRL (Gradient Reversal Layer)
+# GRL
 # =========================
 class GradReverse(torch.autograd.Function):
     @staticmethod
@@ -275,59 +215,131 @@ def grad_reverse(x, lambd=1.0):
 
 
 # =========================
+# 模型构建
+# =========================
+def build_encoder(device=DEVICE, dim_in=2048, num_heads=8, window_size=5, size=21):
+    return LocalUncertaintyAwareGraphAttentionLite(
+        dim_in=dim_in,
+        num_heads=num_heads,
+        window_size=window_size,
+        sim_temperature=0.07,
+        neighbor_temp=0.5,
+        uncertainty_mode="variance",
+        use_relative_pos_bias=True,
+        norm="ln",
+        size=size,
+    ).to(device)
+
+
+def build_student_with_event_head(device=DEVICE, size=T):
+    """Stage 1: encoder + FrameWiseHead, 从头训事件。"""
+    student = build_encoder(device=device, size=size)
+    student.detector = FrameWiseHead(in_features=2176).to(device)
+    hook = EncoderPreHook(student)
+    return student, hook, 2176
+
+
+def build_student_with_scene_head_from_event_ckpt(event_ckpt_path, device=DEVICE,
+                                                  size=T, mlp_hid=512, mlp_out=1):
+    """Stage 2: encoder ← 最佳事件 ckpt; detector = MlpHead (随机)。"""
+    student = build_encoder(device=device, size=size)
+    student.detector = MlpHead(in_dim=2176, hid_dim=mlp_hid, out_dim=mlp_out).to(device)
+    load_backbone_only(student, event_ckpt_path, detector_prefix="detector.")
+    print("✅ Student backbone initialized from best event ckpt; detector = MlpHead")
+    hook = EncoderPreHook(student)
+    return student, hook, 2176
+
+
+def build_teacher_encoder_from_event_ckpt(ckpt_path, device=DEVICE, size=T):
+    """Stage 2: teacher encoder ← 最佳事件 ckpt (frozen)。"""
+    teacher = build_encoder(device=device, size=size)
+    load_backbone_only(teacher, ckpt_path, detector_prefix="detector.")
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher.eval()
+    teacher.detector = nn.Identity().to(device)
+    hook = EncoderPreHook(teacher)
+    return teacher, hook, 2176
+
+
+def build_teacher_event_detector_from_ckpt(ckpt_path, device=DEVICE, in_features=2176):
+    """从最佳事件 ckpt 提取 FrameWiseHead 作为冻结的事件检测头 (cross-task 验证)。"""
+    head = FrameWiseHead(in_features=in_features).to(device)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = extract_state_dict(ckpt)
+    sd = strip_module_prefix(sd)
+    head_sd = {
+        k.replace("detector.", "", 1): v
+        for k, v in sd.items() if k.startswith("detector.")
+    }
+    info = head.load_state_dict(head_sd, strict=False)
+    print("Teacher event detector load -> Missing:", info.missing_keys)
+    print("Teacher event detector load -> Unexpected:", info.unexpected_keys)
+    print("Loaded event-head params:", len(head_sd))
+    head.eval()
+    for p in head.parameters():
+        p.requires_grad_(False)
+    return head
+
+
+# =========================
 # Data helpers
 # =========================
-def build_subset_loader_scene(split_json, keep_ratio, batch_size, seg_sz):
-    """加载场景数据并按 keep_ratio 采样子集"""
+def build_subset_loader_scene(split_json, keep_ratio, batch_size, seg_sz, mode='train'):
     full_loader = load_data(
         LABEL_PATH, IMG_PATH, PLC_PATH, split_json,
-        batch_size, seg_sz=seg_sz, mode1='train'
+        batch_size, seg_sz=seg_sz, mode1=mode
     )
     dataset = full_loader.dataset
     N = len(dataset)
+    if keep_ratio >= 1.0:
+        return full_loader, N, N
     keep = max(1, int(N * keep_ratio))
     indices = torch.randperm(N)[:keep].tolist()
     subset = torch.utils.data.Subset(dataset, indices)
     loader = torch.utils.data.DataLoader(
-        subset, batch_size=batch_size, shuffle=True, num_workers=2,
-        pin_memory=False, drop_last=True
+        subset, batch_size=batch_size, shuffle=True, num_workers=0,
+        pin_memory=False, drop_last=True,
+        persistent_workers=False,
     )
     return loader, keep, N
 
 
-def build_subset_loader_event(
-    keep_ratio: float,
-    batch_size: int,
-    seg_sz: int,
-    device: str = DEVICE,
-):
-    """加载事件任务 (Kinetics) 数据并按 keep_ratio 采样子集"""
+def build_subset_loader_event(keep_ratio, batch_size, seg_sz, device=DEVICE):
     args = argparse.Namespace()
-    args.feature_path =  kinetics_dataset_path + "features"
-    args.score_path =  kinetics_dataset_path + "data"
-    args.annotation_path =  kinetics_dataset_path + "data"
-    args.window_size = seg_sz
-    args.interval = 1
-    args.device = device
+    args.feature_path    = kinetics_dataset_path + "features"
+    args.score_path      = kinetics_dataset_path + "data"
+    args.annotation_path = kinetics_dataset_path + "data"
+    args.window_size     = seg_sz
+    args.interval        = 1
+    args.device          = device
 
     dataset_full = build_kinetics(split='train', args=args)
     N = len(dataset_full)
-    keep = max(1, int(N * keep_ratio))
+    if keep_ratio >= 1.0:
+        loader = torch.utils.data.DataLoader(
+            dataset_full, batch_size=batch_size, shuffle=True,
+            collate_fn=collate_fn, num_workers=0,
+            pin_memory=False, drop_last=True,
+            persistent_workers=False,
+        )
+        print(f"[Event (Kinetics)] full: {N}")
+        return loader, N, N
 
+    keep = max(1, int(N * keep_ratio))
     indices = torch.randperm(N)[:keep].tolist()
     subset = torch.utils.data.Subset(dataset_full, indices)
     loader = torch.utils.data.DataLoader(
         subset, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2,
-        pin_memory=False, drop_last=True
+        collate_fn=collate_fn, num_workers=0,
+        pin_memory=False, drop_last=True,
+        persistent_workers=False,
     )
-
     print(f"[Event (Kinetics)] subset: {keep}/{N} ({keep/N:.1%})")
     return loader, keep, N
 
 
 def paired_iter(loader_a, loader_b):
-    """交替迭代两个 DataLoader"""
     ita, itb = iter(loader_a), iter(loader_b)
     while True:
         try:
@@ -344,14 +356,41 @@ def paired_iter(loader_a, loader_b):
 
 
 # =========================
-# Train / Eval
+# STAGE 1: 事件独立预训练
 # =========================
-def train_epoch_schemeA_mixed(
-    train_loader_scene: DataLoader,
-    train_loader_event: DataLoader,
-    student: nn.Module, stu_hook: EncoderPreHook, stu_z_dim: int,
-    teacher: nn.Module, tea_hook: EncoderPreHook, tea_z_dim: int,
-    disc: nn.Module,
+def train_epoch_event_only(train_loader_event, student, opti, lr_sh=None, device=DEVICE):
+    student.train().to(device)
+    pbar = tqdm(train_loader_event, desc="Stage 1: Train(Event only)")
+
+    for batch in pbar:
+        locations, features, targets_list, num_frames, base, coherence = batch
+        features = features.to(device, non_blocking=True)
+        cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
+        cls_label = cls_label.to(device, non_blocking=True).float()
+
+        opti.zero_grad(set_to_none=True)
+        score_logit, center_pred = student(features)
+        loss = F.binary_cross_entropy_with_logits(score_logit, cls_label)
+        loss.backward()
+        opti.step()
+        if lr_sh is not None:
+            lr_sh.step()
+        pbar.set_postfix(loss=float(loss.item()))
+
+
+# =========================
+# STAGE 2: 场景训练 + 事件 teacher KD + 域对抗 (完整 SchemeA)
+#   - 主任务: 场景 BCE   (新域 = 场景)
+#   - 辅助:  事件        (旧域, 仅供域对抗)
+#   - Teacher: 来自最佳事件 ckpt 的 encoder (frozen)
+#   - 每 step 都更新 Disc, 然后 GRL 对学生反向
+# =========================
+def train_epoch_scene_with_event_teacher(
+    train_loader_scene: DataLoader,        # 主任务 (新域 = 场景)
+    train_loader_event_aux: DataLoader,    # 旧域 (事件), 仅供域对抗
+    student, stu_hook, stu_z_dim,
+    teacher, tea_hook, tea_z_dim,
+    disc,
     opt_main, opt_disc,
     lr_sh_main=None, lr_sh_disc=None,
     device=DEVICE,
@@ -359,35 +398,33 @@ def train_epoch_schemeA_mixed(
     lambda_adv=LAMBDA_ADV,
     proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
 ):
-    """训练混合：场景(新域) 70% + 事件(旧域) 30% with 域对抗"""
     student.train().to(device)
     teacher.eval().to(device)
     disc.train().to(device)
-
-    bce = nn.BCEWithLogitsLoss()
 
     proj = nn.Identity().to(device)
     if proj_to_teacher or (stu_z_dim != tea_z_dim):
         proj = nn.Linear(stu_z_dim, tea_z_dim, bias=False).to(device)
 
-    it = paired_iter(train_loader_scene, train_loader_event)
-    pbar = tqdm(range(len(train_loader_scene)), desc="Train(Scene 70% + Event 30%) + SchemeA")
+    # 主任务 epoch 长度跟随 scene loader
+    it = paired_iter(train_loader_scene, train_loader_event_aux)
+    pbar = tqdm(range(len(train_loader_scene)),
+                desc="Stage 2: Train(Scene primary + Event aux) + SchemeA")
 
     for _ in pbar:
         batch_scene, batch_event = next(it)
         (name, img_s, plc_s, label_s, pos, _, _) = batch_scene
         (locations, features, targets_list, num_frames, base, coherence) = batch_event
-        features = features.cuda(device, non_blocking=True)
 
-        cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
-        cls_label = cls_label.cuda(device, non_blocking=True)
-
-        img_s = img_s.to(device, non_blocking=True)
-        plc_s = plc_s.to(device, non_blocking=True)
+        # 场景 (主任务/新域)
+        img_s   = img_s.to(device, non_blocking=True)
+        plc_s   = plc_s.to(device, non_blocking=True)
         label_s = label_s.to(device, non_blocking=True).float()
-
         w = 0.7
         x_new = w * img_s + (1 - w) * plc_s
+
+        # 事件 (旧域, 仅 adv 用)
+        features = features.to(device, non_blocking=True)
         x_old = features
 
         # 1) 更新域判别器
@@ -412,16 +449,16 @@ def train_epoch_schemeA_mixed(
         # 2) 更新学生
         opt_main.zero_grad(set_to_none=True)
 
-        # 新任务监督
-        logits_new, _ = student(x_new)
-        logits_new = logits_new.squeeze(-1)
-        loss_task = bce(logits_new, label_s)
+        # 主任务: 场景 BCE
+        logits, _center = student(x_new)
+        logits = logits.squeeze(-1)
+        loss_task = F.binary_cross_entropy_with_logits(logits, label_s)
 
-        # 特征蒸馏
+        # 特征蒸馏: 在新域(scene)输入上, 让 student encoder 仍贴近 event-pretrained teacher
         with torch.no_grad():
-            _, _ = teacher(x_new)
+            _ = teacher(x_new)
             z_t_new = tea_hook.z
-        _, _ = student(x_new)
+        _ = student(x_new)
         z_s_new = stu_hook.z
         z_s_new_proj = proj(z_s_new)
         loss_feat = F.mse_loss(z_s_new_proj, z_t_new)
@@ -443,219 +480,42 @@ def train_epoch_schemeA_mixed(
         if lr_sh_main is not None:
             lr_sh_main.step()
 
-        pbar.set_postfix(task=float(loss_task.item()),
-                         feat=float(loss_feat.item()),
-                         adv=float(loss_adv.item()),
-                         d=float(loss_disc.item()),
-                         total=float(loss_total.item()))
+        pbar.set_postfix(
+            task=float(loss_task.item()),
+            feat=float(loss_feat.item()),
+            adv=float(loss_adv.item()),
+            d=float(loss_disc.item()),
+            total=float(loss_total.item()),
+        )
 
-def train_epoch_abs_wo_global_disc(
-    train_loader_scene: DataLoader,
-    train_loader_event: DataLoader,
-    student: nn.Module, stu_hook: EncoderPreHook, stu_z_dim: int,
-    teacher: nn.Module, tea_hook: EncoderPreHook, tea_z_dim: int,
-    disc: nn.Module,
-    opt_main, opt_disc,
-    lr_sh_main=None, lr_sh_disc=None,
-    device=DEVICE,
-    alpha_feat=ALPHA_FEAT,
-    lambda_adv=LAMBDA_ADV,
-    proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
-):
-    """训练混合：场景(新域) 70% + 事件(旧域) 30% with 域对抗"""
-    student.train().to(device)
-    teacher.eval().to(device)
-    disc.train().to(device)
 
-    bce = nn.BCEWithLogitsLoss()
-
-    proj = nn.Identity().to(device)
-    if proj_to_teacher or (stu_z_dim != tea_z_dim):
-        proj = nn.Linear(stu_z_dim, tea_z_dim, bias=False).to(device)
-
-    it = paired_iter(train_loader_scene, train_loader_event)
-    pbar = tqdm(range(len(train_loader_scene)), desc="Train(Scene 70% + Event 30%) + SchemeA")
-
-    for _ in pbar:
-        batch_scene, batch_event = next(it)
-        (name, img_s, plc_s, label_s, pos, _, _) = batch_scene
-        (locations, features, targets_list, num_frames, base, coherence) = batch_event
-        features = features.cuda(device, non_blocking=True)
-
+# =========================
+# STAGE 3: 冻结 backbone, 只训新的 FrameWiseHead
+# =========================
+def train_epoch_event_head_only(train_loader, model, opti, lr_sh=None, device=DEVICE):
+    model.train().to(device)
+    pbar = tqdm(train_loader, desc="Stage 3: Train(Event head only)")
+    for batch in pbar:
+        locations, features, targets_list, num_frames, base, coherence = batch
+        features = features.to(device, non_blocking=True)
         cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
-        cls_label = cls_label.cuda(device, non_blocking=True)
+        cls_label = cls_label.to(device, non_blocking=True).float()
 
-        img_s = img_s.to(device, non_blocking=True)
-        plc_s = plc_s.to(device, non_blocking=True)
-        label_s = label_s.to(device, non_blocking=True).float()
+        opti.zero_grad(set_to_none=True)
+        score_logit, center_pred = model(features)
+        loss = F.binary_cross_entropy_with_logits(score_logit, cls_label)
+        loss.backward()
+        opti.step()
+        if lr_sh is not None:
+            lr_sh.step()
+        pbar.set_postfix(loss=float(loss.item()))
 
-        w = 0.7
-        x_new = w * img_s + (1 - w) * plc_s
-        x_old = features
 
-        
-        # with torch.no_grad():
-        #     _ = student(x_new)
-        #     z_new = stu_hook.z.detach()
-        #     _ = student(x_old)
-        #     z_old = stu_hook.z.detach()
-        # x_dom = torch.cat([z_old, z_new], dim=0)
-        # y_dom = torch.cat([
-        #     torch.zeros(z_old.size(0), 1, device=device),
-        #     torch.ones(z_new.size(0), 1, device=device),
-        # ], dim=0)
-        # logit_d = disc(x_dom)
-        # loss_disc = F.binary_cross_entropy_with_logits(logit_d, y_dom)
-        # loss_disc.backward()
-        # opt_disc.step()
-        if lr_sh_disc is not None:
-            lr_sh_disc.step()
-
-        # 2) 更新学生
-        opt_main.zero_grad(set_to_none=True)
-
-        # 新任务监督
-        logits_new, _ = student(x_new)
-        logits_new = logits_new.squeeze(-1)
-        loss_task = bce(logits_new, label_s)
-
-        # 特征蒸馏
-        with torch.no_grad():
-            _, _ = teacher(x_new)
-            z_t_new = tea_hook.z
-        _, _ = student(x_new)
-        z_s_new = stu_hook.z
-        z_s_new_proj = proj(z_s_new)
-        loss_feat = F.mse_loss(z_s_new_proj, z_t_new)
-
-        # 域对抗
-        _ = student(x_old)
-        z_s_old = stu_hook.z
-        z_all = torch.cat([z_s_old, z_s_new], dim=0)
-        y_all = torch.cat([
-            torch.zeros(z_s_old.size(0), 1, device=device),
-            torch.ones(z_s_new.size(0), 1, device=device),
-        ], dim=0)
-        logits_adv = disc(grad_reverse(z_all, lambd=1.0))
-        loss_adv = F.binary_cross_entropy_with_logits(logits_adv, y_all)
-
-        loss_total = loss_task + alpha_feat * loss_feat + lambda_adv * loss_adv
-        loss_total.backward()
-        opt_main.step()
-        if lr_sh_main is not None:
-            lr_sh_main.step()
-
-        pbar.set_postfix(task=float(loss_task.item()),
-                         feat=float(loss_feat.item()),
-                         adv=float(loss_adv.item()),
-                        #  d=float(loss_disc.item()),
-                         total=float(loss_total.item()))
-
-def train_epoch_abs_wo_disc(
-    train_loader_scene: DataLoader,
-    train_loader_event: DataLoader,
-    student: nn.Module, stu_hook: EncoderPreHook, stu_z_dim: int,
-    teacher: nn.Module, tea_hook: EncoderPreHook, tea_z_dim: int,
-    disc: nn.Module,
-    opt_main, opt_disc,
-    lr_sh_main=None, lr_sh_disc=None,
-    device=DEVICE,
-    alpha_feat=ALPHA_FEAT,
-    lambda_adv=LAMBDA_ADV,
-    proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
-):
-    """训练混合：场景(新域) 70% + 事件(旧域) 30% with 域对抗"""
-    student.train().to(device)
-    teacher.eval().to(device)
-    disc.train().to(device)
-
-    bce = nn.BCEWithLogitsLoss()
-
-    proj = nn.Identity().to(device)
-    if proj_to_teacher or (stu_z_dim != tea_z_dim):
-        proj = nn.Linear(stu_z_dim, tea_z_dim, bias=False).to(device)
-
-    it = paired_iter(train_loader_scene, train_loader_event)
-    pbar = tqdm(range(len(train_loader_scene)), desc="Train(Scene 70% + Event 30%) + SchemeA")
-
-    for _ in pbar:
-        batch_scene, batch_event = next(it)
-        (name, img_s, plc_s, label_s, pos, _, _) = batch_scene
-        (locations, features, targets_list, num_frames, base, coherence) = batch_event
-        features = features.cuda(device, non_blocking=True)
-
-        cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
-        cls_label = cls_label.cuda(device, non_blocking=True)
-
-        img_s = img_s.to(device, non_blocking=True)
-        plc_s = plc_s.to(device, non_blocking=True)
-        label_s = label_s.to(device, non_blocking=True).float()
-
-        w = 0.7
-        x_new = w * img_s + (1 - w) * plc_s
-        x_old = features
-
-        
-        # with torch.no_grad():
-        #     _ = student(x_new)
-        #     z_new = stu_hook.z.detach()
-        #     _ = student(x_old)
-        #     z_old = stu_hook.z.detach()
-        # x_dom = torch.cat([z_old, z_new], dim=0)
-        # y_dom = torch.cat([
-        #     torch.zeros(z_old.size(0), 1, device=device),
-        #     torch.ones(z_new.size(0), 1, device=device),
-        # ], dim=0)
-        # logit_d = disc(x_dom)
-        # loss_disc = F.binary_cross_entropy_with_logits(logit_d, y_dom)
-        # loss_disc.backward()
-        # opt_disc.step()
-        if lr_sh_disc is not None:
-            lr_sh_disc.step()
-
-        # 2) 更新学生
-        opt_main.zero_grad(set_to_none=True)
-
-        # 新任务监督
-        logits_new, _ = student(x_new)
-        logits_new = logits_new.squeeze(-1)
-        loss_task = bce(logits_new, label_s)
-
-        # 特征蒸馏
-        with torch.no_grad():
-            _, _ = teacher(x_new)
-            z_t_new = tea_hook.z
-        _, _ = student(x_new)
-        z_s_new = stu_hook.z
-        z_s_new_proj = proj(z_s_new)
-        loss_feat = F.mse_loss(z_s_new_proj, z_t_new)
-
-        # 域对抗
-        _ = student(x_old)
-        z_s_old = stu_hook.z
-        z_all = torch.cat([z_s_old, z_s_new], dim=0)
-        y_all = torch.cat([
-            torch.zeros(z_s_old.size(0), 1, device=device),
-            torch.ones(z_s_new.size(0), 1, device=device),
-        ], dim=0)
-        logits_adv = disc(grad_reverse(z_all, lambd=1.0))
-        loss_adv = F.binary_cross_entropy_with_logits(logits_adv, y_all)
-
-        loss_total = loss_task + alpha_feat * loss_feat + lambda_adv * loss_adv
-        loss_total.backward()
-        opt_main.step()
-        if lr_sh_main is not None:
-            lr_sh_main.step()
-
-        pbar.set_postfix(task=float(loss_task.item()),
-                         feat=float(loss_feat.item()),
-                         adv=float(loss_adv.item()),
-                        #  d=float(loss_disc.item()),
-                         total=float(loss_total.item()))
-
+# =========================
+# Eval
+# =========================
 @torch.no_grad()
 def eval_epoch_scene(test_loader, model, device=DEVICE):
-    """评估场景检测性能"""
     model.eval()
     predlist, labelist, pathlist, idlist = [], [], [], []
     for sample in tqdm(test_loader, desc="Eval(Scene)"):
@@ -664,10 +524,8 @@ def eval_epoch_scene(test_loader, model, device=DEVICE):
         plc_ctx = plc_ctx.to(device, non_blocking=True)
         w = 0.7
         x = w * img_ctx + (1 - w) * plc_ctx
-
         logits, center = model(x)
         probs = center.squeeze().cpu().numpy()
-
         predlist.append(probs)
         labelist.append(label.numpy())
         pathlist.append(names)
@@ -678,21 +536,17 @@ def eval_epoch_scene(test_loader, model, device=DEVICE):
 
 @torch.no_grad()
 def test_epoch_event(testload, model, gpu=0):
-    """推理事件数据集并收集边界预测"""
     model.eval().cuda(gpu)
     results_dict = defaultdict(list)
-
     for batch in tqdm(testload, desc="Evaluate(Event Dataset)"):
         locations, features, targets_list, num_frames, base, coherence = batch
         B, L, _ = features.shape
         features = features.cuda(gpu, non_blocking=True)
-
         score_logit, center_pred = model(features)
         probs = torch.sigmoid(score_logit)
 
         base_b = base.view(-1).to(features.device).float()
         loc = locations.to(features.device).float()
-
         t = center_pred.clamp(0, 1) * (L - 1)
         lo = t.floor().long().clamp(0, L - 1)
         hi = (lo + 1).clamp(0, L - 1)
@@ -711,49 +565,10 @@ def test_epoch_event(testload, model, gpu=0):
             )
             vid = str(vid)
             results_dict[vid].append({
-                "boundaries": abs_frames[i : i + 1].detach().cpu(),
-                "scores": probs[i : i + 1].detach().cpu(),
+                "boundaries": abs_frames[i:i+1].detach().cpu(),
+                "scores": probs[i:i+1].detach().cpu(),
             })
     return dict(results_dict)
-
-
-def train_epoch_event(
-    trainload,
-    model,
-    opti,
-    lr_sh,
-    gpu=0,
-    pos_weight=None,
-    lambda_reg=1.0,
-):
-    """训练事件检测 (FrameWiseHead)"""
-    model.train().cuda(gpu)
-    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
-    l1 = nn.SmoothL1Loss(reduction='none')
-
-    progress = tqdm(trainload, desc="Train(K=1, Center+Score)")
-
-    for sample in progress:
-        locations, features, targets_list, num_frames, base, coherence = sample
-        features = features.cuda(gpu, non_blocking=True)
-
-        cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
-        cls_label = cls_label.cuda(gpu, non_blocking=True)
-        center_gt = center_gt.cuda(gpu, non_blocking=True)
-        has_pos = has_pos.cuda(gpu, non_blocking=True)
-
-        opti.zero_grad(set_to_none=True)
-
-        score_logit, center_pred = model(features)
-        loss_cls = F.binary_cross_entropy_with_logits(score_logit, cls_label.float())
-
-        loss = loss_cls
-        loss.backward()
-        opti.step()
-        if lr_sh is not None:
-            lr_sh.step()
-
-        progress.set_postfix(loss=float(loss.item()))
 
 
 def evaluate_multi_thresholds(
@@ -764,319 +579,453 @@ def evaluate_multi_thresholds(
     step_frames=1,
     log_tag="event_eval",
 ):
-    """多阈值评测事件检测性能"""
     if thresholds is None:
         thresholds = [0.10, 0.20, 0.30, 0.40, 0.50]
-
     seconds_map_by_thresh = save_submission_in_seconds_multi_thresh(
-        results,
-        anno_root_path,
-        thresholds,
+        results, anno_root_path, thresholds,
         step_frames=step_frames,
         out_dir=f"{log_tag}_pred_outputs",
-        write_pkls=False,
-        debug=True,
+        write_pkls=False, debug=True,
     )
-
     eval_results = eval_by_frame_metric_from_seconds_map(
-        anno_root_path,
-        seconds_map_by_thresh,
-        downsample=1,
-        rel_dist_list=rel_dist_list,
-        filter_low_consis=True,
-        consis_th=0.3,
-        debug=True,
+        anno_root_path, seconds_map_by_thresh,
+        downsample=1, rel_dist_list=rel_dist_list,
+        filter_low_consis=True, consis_th=0.3, debug=True,
     )
-
     global_avg = summarize_global_avg_over_thresholds(eval_results, d=0.10)
     print(
         f"[GLOBAL AVG] F1@0.10={global_avg['f1']:.4f} "
         f"(Prec={global_avg['precision']:.4f}, Rec={global_avg['recall']:.4f})"
     )
-    return eval_results
+    return eval_results, float(global_avg['f1'])
+
+
+@torch.no_grad()
+def eval_event_with_external_detector(encoder_model, external_detector, testload, gpu=0):
+    old = encoder_model.detector
+    encoder_model.detector = external_detector
+    try:
+        return test_epoch_event(testload, encoder_model, gpu=gpu)
+    finally:
+        encoder_model.detector = old
+
+
+@torch.no_grad()
+def eval_scene_with_external_detector(encoder_model, external_detector, test_loader, device=DEVICE):
+    old = encoder_model.detector
+    encoder_model.detector = external_detector
+    try:
+        return eval_epoch_scene(test_loader, encoder_model, device=device)
+    finally:
+        encoder_model.detector = old
 
 
 # =========================
-# Main
+# STAGE 1: Event-Only (from scratch)
 # =========================
-def main():
-    print("\n" + "="*60)
-    print("PHASE 1: 场景检测 (Scene) with 域对抗学习")
-    print("="*60)
+def run_stage1():
+    print("\n" + "=" * 60)
+    print("STAGE 1: 事件独立预训练 (产出最佳事件 ckpt 作为下游基础)")
+    print("=" * 60)
 
-    # 构建场景训练子集 (70%)
-    train_loader_scene_70, scene_keep, scene_total = build_subset_loader_scene(
-        SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T
-    )
-    print(f"[Scene] subset: {scene_keep}/{scene_total} ({scene_keep/scene_total:.1%})")
+    args_eval = argparse.Namespace()
+    args_eval.feature_path    = kinetics_dataset_path + "features"
+    args_eval.annotation_path = kinetics_dataset_path + "data"
+    args_eval.score_path      = kinetics_dataset_path + "data"
+    args_eval.window_size     = T
+    args_eval.interval        = 1
+    args_eval.device          = DEVICE
 
-    # 构建事件训练子集 (30%)
-    train_loader_event_30, event_keep, event_total = build_subset_loader_event(
+    train_loader_event, event_keep, event_total = build_subset_loader_event(
         EVENT_KEEP_RATIO, BATCH_SIZE, T
     )
+    print(f"[Event-pretrain] subset: {event_keep}/{event_total} "
+          f"({event_keep/event_total:.1%})")
 
-    # 场景测试集（全量）
-    test_loader = load_data(
-        LABEL_PATH, IMG_PATH, PLC_PATH,  SPLIT_PATH_SCENE,
+    val_dataset_event = build_kinetics(split='val', args=args_eval)
+    val_loader_event = DataLoader(
+        val_dataset_event, batch_size=256, shuffle=False,
+        collate_fn=collate_fn, num_workers=0, pin_memory=False,
+        persistent_workers=False,
+    )
+
+    student, stu_hook, stu_z_dim = build_student_with_event_head(device=DEVICE, size=T)
+
+    opt_pretrain = torch.optim.Adam(
+        student.parameters(),
+        lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
+    )
+    n_steps0 = len(train_loader_event)
+    lr_sh_pretrain = torch.optim.lr_scheduler.LambdaLR(
+        opt_pretrain,
+        warmup_decay_cosine(n_steps0, n_steps0 * max(EVENT_PRETRAIN_EPOCHS - 1, 1))
+    )
+
+    best_event_f1 = None
+
+    for ep in range(EVENT_PRETRAIN_EPOCHS):
+        train_epoch_event_only(train_loader_event, student, opt_pretrain,
+                               lr_sh_pretrain, device=DEVICE)
+
+        results_dict = test_epoch_event(val_loader_event, student, gpu=GPU)
+        eval_res, ev_f1 = evaluate_multi_thresholds(
+            results_dict, anno_root_path=args_eval.annotation_path,
+            thresholds=[0.10, 0.20, 0.30, 0.40, 0.50],
+            rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+            step_frames=1, log_tag=f'stage1_event_ep{ep}'
+        )
+        print(f"[Stage1 Epoch {ep}] event F1@0.10 = {ev_f1:.4f}")
+
+        save_json(
+            {
+                "stage": "stage1_event_pretrain",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "f1_at_0.10_global_avg": ev_f1,
+                "event_subset": {"keep": event_keep, "total": event_total,
+                                 "ratio": event_keep / event_total},
+            },
+            os.path.join(CKPT_DIR, f"stage1_event_eval_ep{ep}.json")
+        )
+        torch.save({"model": student.state_dict(), "epoch": ep},
+                   os.path.join(CKPT_DIR, f"stage1_event_ep{ep}.pth"))
+
+        if best_event_f1 is None or ev_f1 > best_event_f1:
+            best_event_f1 = ev_f1
+            torch.save(
+                {"model": student.state_dict(), "epoch": ep, "f1": ev_f1},
+                EVENT_ONLY_BEST_PATH
+            )
+            print(f"[Stage1] new best event F1@0.10={ev_f1:.4f} -> {EVENT_ONLY_BEST_PATH}")
+
+    stu_hook.close()
+    print(f"\n[Stage 1 DONE] Best event F1@0.10 = {best_event_f1}")
+    print(f"               Saved: {EVENT_ONLY_BEST_PATH}")
+    print("Now run:  python train_3stages_event_first.py --stage 2")
+
+
+# =========================
+# STAGE 2: 场景训练 + 事件 teacher KD + 域对抗
+# =========================
+def run_stage2():
+    print("\n" + "=" * 60)
+    print("STAGE 2: 场景训练 (以最佳事件 ckpt 为基础) + 事件 KD + 域对抗 (Full SchemeA)")
+    print("=" * 60)
+
+    require_ckpt(EVENT_ONLY_BEST_PATH, "2 (Scene + Event teacher)")
+
+    # 主任务: 场景全量
+    train_loader_scene_main, scene_keep, scene_total = build_subset_loader_scene(
+        SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T, mode='train'
+    )
+    print(f"[Stage2 Scene-main] subset: {scene_keep}/{scene_total} "
+          f"({scene_keep/scene_total:.1%})")
+
+    # 辅助: 事件子集 (仅 adv)
+    train_loader_event_aux, event_aux_keep, event_aux_total = build_subset_loader_event(
+        EVENT_AUX_RATIO, BATCH_SIZE, T
+    )
+    print(f"[Stage2 Event-aux] subset: {event_aux_keep}/{event_aux_total} "
+          f"({event_aux_keep/event_aux_total:.1%})")
+
+    # 测试 loader (注意: 第二次调 load_data, 会复用 load_movienet_server 里的 pkl 缓存)
+    test_loader_scene = load_data(
+        LABEL_PATH, IMG_PATH, PLC_PATH, SPLIT_PATH_SCENE,
         BATCH_SIZE, seg_sz=T, mode1='test'
     )
 
-    # 构建学生和教师
-    student, stu_hook, stu_z_dim = build_student(device=DEVICE, size=T)
-    teacher, tea_hook, tea_z_dim = build_teacher_encoder(ckpt_path=CKPT_EVENT, device=DEVICE, size=T)
-    teacher_event_detector = build_teacher_event_detector(
-    ckpt_path=CKPT_EVENT,
-    device=DEVICE,
-    in_features=2176,
-    save_dir=CKPT_DIR,
-)
+    # 学生: encoder ← best event ckpt + MlpHead
+    student, stu_hook, stu_z_dim = build_student_with_scene_head_from_event_ckpt(
+        event_ckpt_path=EVENT_ONLY_BEST_PATH, device=DEVICE, size=T
+    )
+
+    # 教师: encoder ← best event ckpt (frozen)
+    teacher, tea_hook, tea_z_dim = build_teacher_encoder_from_event_ckpt(
+        ckpt_path=EVENT_ONLY_BEST_PATH, device=DEVICE, size=T
+    )
+    print("✅ Teacher (event-pretrained encoder) loaded & frozen")
+
+    # 教师事件 detector (cross-task 验证用)
+    teacher_event_detector = build_teacher_event_detector_from_ckpt(
+        ckpt_path=EVENT_ONLY_BEST_PATH, device=DEVICE
+    )
+    print("✅ Teacher event detector (FrameWiseHead) loaded & frozen")
 
     # 判别器
     disc = TemporalDiscriminator(in_dim=stu_z_dim).to(DEVICE)
 
-    # 优化器
     opt_main = torch.optim.Adam(
         [p for p in student.parameters() if p.requires_grad],
         lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
     )
-    opt_disc = torch.optim.Adam(disc.parameters(), lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4)
+    opt_disc = torch.optim.Adam(disc.parameters(), lr=1e-4,
+                                betas=(0.9, 0.98), weight_decay=1e-4)
 
+    n_steps2 = len(train_loader_scene_main)
     lr_sh_main = torch.optim.lr_scheduler.LambdaLR(
-        opt_main, warmup_decay_cosine(len(train_loader_scene_70), len(train_loader_scene_70) * max(EPOCHS - 1, 1))
+        opt_main, warmup_decay_cosine(n_steps2, n_steps2 * max(SCENE_TRAIN_EPOCHS - 1, 1))
     )
     lr_sh_disc = torch.optim.lr_scheduler.LambdaLR(
-        opt_disc, warmup_decay_cosine(len(train_loader_scene_70), len(train_loader_scene_70) * max(EPOCHS - 1, 1))
+        opt_disc, warmup_decay_cosine(n_steps2, n_steps2 * max(SCENE_TRAIN_EPOCHS - 1, 1))
     )
 
-    best_metric = None
-    best_path = os.path.join(CKPT_DIR, "scene_best.pth")
+    best_scene_score = None
 
-    # 训练场景检测
-    for ep in range(EPOCHS):
-        train_epoch_schemeA_mixed(
-        train_loader_scene=train_loader_scene_70,
-        train_loader_event=train_loader_event_30,
-        student=student, stu_hook=stu_hook, stu_z_dim=stu_z_dim,
-        teacher=teacher, tea_hook=tea_hook, tea_z_dim=tea_z_dim,
-        disc=disc,
-        opt_main=opt_main, opt_disc=opt_disc,
-        lr_sh_main=lr_sh_main, lr_sh_disc=lr_sh_disc,
-        device=DEVICE,
-        alpha_feat=ALPHA_FEAT,
-        lambda_adv=LAMBDA_ADV,
-        proj_to_teacher=USE_PROJ_TO_TEACHER
-    )
+    # event val loader (用于 ExtraVal1)
+    args_eval = argparse.Namespace()
+    args_eval.feature_path    = kinetics_dataset_path + "features"
+    args_eval.annotation_path = kinetics_dataset_path + "data"
+    args_eval.score_path      = kinetics_dataset_path + "data"
+    args_eval.window_size     = T
+    args_eval.interval        = 1
+    args_eval.device          = DEVICE
 
-        met, moviePL = eval_epoch_scene(test_loader, student, device=DEVICE)
-        print(f"[Epoch {ep}] metric = {met}")
-        scene_eval_record = {
-            "stage": "phase1_scene_training",
-            "epoch": ep,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "metric": met,
-            "moviePL": moviePL,
-            "scene_subset": {
-                "keep": scene_keep,
-                "total": scene_total,
-                "ratio": scene_keep / scene_total,
-            },
-            "event_subset": {
-            "keep": event_keep,
-            "total": event_total,
-            "ratio": event_keep / event_total,
-            },
-            "alpha_feat": ALPHA_FEAT,
-            "lambda_adv": LAMBDA_ADV,
-        }
-
-        save_json(
-            scene_eval_record,
-            os.path.join(CKPT_DIR, f"scene_eval_ep{ep}.json")
+    for ep in range(SCENE_TRAIN_EPOCHS):
+        train_epoch_scene_with_event_teacher(
+            train_loader_scene=train_loader_scene_main,
+            train_loader_event_aux=train_loader_event_aux,
+            student=student, stu_hook=stu_hook, stu_z_dim=stu_z_dim,
+            teacher=teacher, tea_hook=tea_hook, tea_z_dim=tea_z_dim,
+            disc=disc,
+            opt_main=opt_main, opt_disc=opt_disc,
+            lr_sh_main=lr_sh_main, lr_sh_disc=lr_sh_disc,
+            device=DEVICE,
+            alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV,
+            proj_to_teacher=USE_PROJ_TO_TEACHER,
         )
 
-        torch.save({"model": student.state_dict(), "epoch": ep},
-               os.path.join(CKPT_DIR, f'scene_ep{ep}.pth'))
+        # 验证场景
+        met, moviePL = eval_epoch_scene(test_loader_scene, student, device=DEVICE)
+        print(f"[Stage2 Epoch {ep}] scene metric = {met}")
 
-        if isinstance(met, dict):
+        save_json(
+            {
+                "stage": "stage2_scene_with_event_teacher",
+                "variant": "full_schemeA",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metric": met,
+                "moviePL": moviePL,
+                "scene_subset":     {"keep": scene_keep, "total": scene_total,
+                                     "ratio": scene_keep / scene_total},
+                "event_aux_subset": {"keep": event_aux_keep, "total": event_aux_total,
+                                     "ratio": event_aux_keep / event_aux_total},
+                "alpha_feat": ALPHA_FEAT,
+                "lambda_adv": LAMBDA_ADV,
+                "best_event_ckpt_used_as_basis": EVENT_ONLY_BEST_PATH,
+            },
+            os.path.join(CKPT_DIR, f"stage2_scene_eval_ep{ep}.json")
+        )
+        torch.save({"model": student.state_dict(), "epoch": ep},
+                   os.path.join(CKPT_DIR, f"stage2_scene_ep{ep}.pth"))
+
+        if isinstance(met, dict) and len(met) > 0:
             key = next(iter(met.keys()))
             score = float(met[key])
-            if (best_metric is None) or (score > best_metric):
-                best_metric = score
-                torch.save({"model": student.state_dict(), "epoch": ep}, best_path)
-                print(f"New best ({key}={score:.4f}) saved -> {best_path}")
+            if best_scene_score is None or score > best_scene_score:
+                best_scene_score = score
+                torch.save(
+                    {"model": student.state_dict(), "epoch": ep, "metric": met,
+                     "selected_key": key, "selected_score": score},
+                    SCENE_WITH_EVENT_TEACHER_BEST_PATH
+                )
+                print(f"[Stage2] new best scene ({key}={score:.4f}) -> "
+                      f"{SCENE_WITH_EVENT_TEACHER_BEST_PATH}")
 
-    print("\n" + "="*60)
-    print("Extra Validation 1: 教师 detector + Phase 1 学生 encoder")
-    print("="*60)
+    # ----- Extra Validation 1: 事件 teacher detector + Stage2 学生 encoder → 评估 event -----
+    print("\n" + "=" * 60)
+    print("Extra Validation 1: 事件 teacher detector + Stage2 学生 encoder (评估事件)")
+    print("=" * 60)
 
-    # 这里先构建事件验证集（如果前面还没建）
-    args_eval = argparse.Namespace()
-    args_eval.feature_path = kinetics_dataset_path + "features"
-    args_eval.annotation_path = kinetics_dataset_path + "data"
-    args_eval.score_path = kinetics_dataset_path + "data"
-    args_eval.window_size = T
-    args_eval.interval = 1
-    args_eval.device = DEVICE
-
-    val_dataset_e2s = build_kinetics(split='val', args=args_eval)
-    val_loader_e2s = torch.utils.data.DataLoader(
-        val_dataset_e2s,
-        batch_size=256,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False
+    val_dataset_event = build_kinetics(split='val', args=args_eval)
+    val_loader_event = DataLoader(
+        val_dataset_event, batch_size=256, shuffle=False,
+        collate_fn=collate_fn, num_workers=0, pin_memory=False,
+        persistent_workers=False,
     )
 
-    results_teacher_head_phase1 = eval_event_with_external_detector(
+    results_dict_xv1 = eval_event_with_external_detector(
         encoder_model=student,
         external_detector=teacher_event_detector,
-        testload=val_loader_e2s,
+        testload=val_loader_event,
         gpu=GPU,
     )
-    print(f"✅ Extra Validation 1 collected predictions for {len(results_teacher_head_phase1)} videos")
-
-    eval_res_teacher_head_phase1 = evaluate_multi_thresholds(
-        results_teacher_head_phase1,
-        anno_root_path=args_eval.annotation_path,
+    eval_res_xv1, ev_f1_xv1 = evaluate_multi_thresholds(
+        results_dict_xv1, anno_root_path=args_eval.annotation_path,
         thresholds=[0.10, 0.20, 0.30, 0.40, 0.50],
         rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
-        step_frames=1,
-        log_tag='event_eval_teacher_head_phase1',
+        step_frames=1, log_tag='stage2_extraval_event'
     )
-
-    extra_val1_record = {
-    "stage": "extra_validation_1_teacher_detector_plus_phase1_encoder",
-    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "num_videos": len(results_teacher_head_phase1),
-    "results": eval_res_teacher_head_phase1,
-}
+    print(f"[ExtraVal1] event F1@0.10 (teacher head + Stage2 encoder) = {ev_f1_xv1:.4f}")
 
     save_json(
-        extra_val1_record,
-    os.path.join(CKPT_DIR, "extra_validation_1_teacher_head_phase1.json")
+        {
+            "stage": "extra_validation_1_event_detector_plus_stage2_encoder",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "f1_at_0.10_global_avg": ev_f1_xv1,
+            "results": eval_res_xv1,
+        },
+        os.path.join(CKPT_DIR, "extra_validation_1_event_head_stage2.json")
     )
-    print("\n" + "="*60)
-    print("PHASE 2: 事件检测 (Event) - 冻结 Backbone，仅训练 FrameWiseHead")
-    print("="*60)
 
-    # 冻结 backbone
-    for param in student.parameters():
-        param.requires_grad = False
-    print("✅ Frozen all student backbone parameters")
+    print(f"\n[Stage 2 DONE] Best scene = {best_scene_score}")
+    print(f"               Saved: {SCENE_WITH_EVENT_TEACHER_BEST_PATH}")
+    print("Now run:  python train_3stages_event_first.py --stage 3")
 
-    # 替换为 FrameWiseHead
+
+# =========================
+# STAGE 3: 冻结 backbone + 训新 FrameWiseHead
+# =========================
+def run_stage3():
+    print("\n" + "=" * 60)
+    print("STAGE 3: 冻结 backbone, 仅训新的 FrameWiseHead (恢复事件头)")
+    print("=" * 60)
+
+    require_ckpt(SCENE_WITH_EVENT_TEACHER_BEST_PATH, "3 (Frozen backbone + new event head)")
+    require_ckpt(EVENT_ONLY_BEST_PATH, "3 (need teacher event detector for extra val)")
+
+    args_eval = argparse.Namespace()
+    args_eval.feature_path    = kinetics_dataset_path + "features"
+    args_eval.annotation_path = kinetics_dataset_path + "data"
+    args_eval.score_path      = kinetics_dataset_path + "data"
+    args_eval.window_size     = T
+    args_eval.interval        = 1
+    args_eval.device          = DEVICE
+
+    train_loader_event_full, _, _ = build_subset_loader_event(1.0, BATCH_SIZE, T)
+    val_dataset_event = build_kinetics(split='val', args=args_eval)
+    val_loader_event = DataLoader(
+        val_dataset_event, batch_size=256, shuffle=False,
+        collate_fn=collate_fn, num_workers=0, pin_memory=False,
+        persistent_workers=False,
+    )
+
+    # 学生: 先按 scene-head 结构搭, 再把 Stage2 best 完整加载 (含 MlpHead),
+    # 然后冻结全部, 最后替换成全新 FrameWiseHead 并解冻
+    student, _stu_hook_old, _ = build_student_with_scene_head_from_event_ckpt(
+        event_ckpt_path=EVENT_ONLY_BEST_PATH, device=DEVICE, size=T
+    )
+    sd = torch.load(SCENE_WITH_EVENT_TEACHER_BEST_PATH, map_location="cpu")
+    sd = extract_state_dict(sd)
+    sd = strip_module_prefix(sd)
+    info = student.load_state_dict(sd, strict=False)
+    print("[Stage3] load Stage2 best -> Missing:", info.missing_keys)
+    print("[Stage3] load Stage2 best -> Unexpected:", info.unexpected_keys)
+
+    for p in student.parameters():
+        p.requires_grad = False
+    print("✅ Frozen all parameters")
+
     student.detector = FrameWiseHead(in_features=2176).to(DEVICE)
-    for param in student.detector.parameters():
-        param.requires_grad = True
-    print("✅ FrameWiseHead parameters enabled for training")
+    for p in student.detector.parameters():
+        p.requires_grad = True
+    print("✅ Fresh FrameWiseHead enabled for training")
 
-    # 重新构建事件 DataLoader
-    args = argparse.Namespace()
-    args.feature_path =  kinetics_dataset_path + "features"
-    args.annotation_path =  kinetics_dataset_path + "data"
-    args.score_path = kinetics_dataset_path + "data"
-    args.window_size = T
-    args.interval = 1
-    args.device = DEVICE
+    # 教师事件 detector (供 ExtraVal2)
+    teacher_event_detector = build_teacher_event_detector_from_ckpt(
+        ckpt_path=EVENT_ONLY_BEST_PATH, device=DEVICE
+    )
+    print("✅ Teacher event detector (FrameWiseHead from Stage 1) loaded & frozen")
 
-    # 构建完整事件训练集和验证集
-    # train_dataset_full = build_kinetics(split='train', args=args)
-    val_dataset = build_kinetics(split='val', args=args)
-
-    # train_loader_event_full = torch.utils.data.DataLoader(
-    #     train_dataset_full, batch_size=BATCH_SIZE, shuffle=True,
-    #     collate_fn=collate_fn, num_workers=0, pin_memory=False, drop_last=True
-    # )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=256, shuffle=False,
-        collate_fn=collate_fn, num_workers=0, pin_memory=False
+    opt_event_head = torch.optim.Adam(
+        student.detector.parameters(),
+        lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
+    )
+    n_steps3 = len(train_loader_event_full)
+    lr_sh_event_head = torch.optim.lr_scheduler.LambdaLR(
+        opt_event_head,
+        warmup_decay_cosine(n_steps3, n_steps3 * max(EVENT_HEAD_EPOCHS - 1, 1))
     )
 
-    # 事件检测优化器（仅 detector）
-    opt_event = torch.optim.Adam(
-        student.detector.parameters(), lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
-    )
-    lr_sh_event = torch.optim.lr_scheduler.LambdaLR(
-        opt_event, warmup_decay_cosine(len(train_loader_event_30), len(train_loader_event_30) * 19)
-    )
+    best_stage3_f1 = None
 
-    # 训练事件检测
-    for ep in range(STAGE_3_EPOCHS):
-        print(f"\n[Event Epoch {ep}]")
-        train_epoch_event(
-            trainload=train_loader_event_30,
-            model=student,
-            opti=opt_event,
-            lr_sh=lr_sh_event,
-            gpu=GPU,
-            pos_weight=None,
-            lambda_reg=1.0
+    for ep in range(EVENT_HEAD_EPOCHS):
+        print(f"\n[Stage3 Event-head Epoch {ep}]")
+        train_epoch_event_head_only(
+            train_loader_event_full, student, opt_event_head,
+            lr_sh_event_head, device=DEVICE
         )
 
-        # 验证
-        print(f"[Event Epoch {ep}] Running validation...")
-        results_dict = test_epoch_event(val_loader, student, gpu=GPU)
-        print(f"✅ Collected predictions for {len(results_dict)} videos")
-
-        # 多阈值评测
-        eval_res = evaluate_multi_thresholds(
-            results_dict,
-            anno_root_path=args.annotation_path,
+        results_dict = test_epoch_event(val_loader_event, student, gpu=GPU)
+        eval_res, ev_f1 = evaluate_multi_thresholds(
+            results_dict, anno_root_path=args_eval.annotation_path,
             thresholds=[0.10, 0.20, 0.30, 0.40, 0.50],
             rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
-            step_frames=1,
-            log_tag='event_eval',
+            step_frames=1, log_tag=f'stage3_event_ep{ep}'
         )
-        event_eval_record = {
-    "stage": "phase2_event_training",
-    "epoch": ep,
-    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "num_videos": len(results_dict),
-    "results": eval_res,
-}
+        print(f"[Stage3 Epoch {ep}] event F1@0.10 = {ev_f1:.4f}")
 
         save_json(
-            event_eval_record,
-            os.path.join(CKPT_DIR, f"event_eval_ep{ep}.json")
+            {
+                "stage": "stage3_event_head_training",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "f1_at_0.10_global_avg": ev_f1,
+            },
+            os.path.join(CKPT_DIR, f"stage3_event_eval_ep{ep}.json")
         )
-
         torch.save({"model": student.state_dict(), "epoch": ep},
-                   os.path.join(CKPT_DIR, f'event_ep{ep}.pth'))
+                   os.path.join(CKPT_DIR, f"stage3_event_ep{ep}.pth"))
 
-        print("\n" + "="*60)
+        if best_stage3_f1 is None or ev_f1 > best_stage3_f1:
+            best_stage3_f1 = ev_f1
+            torch.save(
+                {"model": student.state_dict(), "epoch": ep, "f1": ev_f1},
+                EVENT_HEAD_BEST_PATH
+            )
+            print(f"[Stage3] new best event F1@0.10={ev_f1:.4f} -> {EVENT_HEAD_BEST_PATH}")
 
-    print("Extra Validation 2: 教师 detector + 当前学生 encoder")
-    print("="*60)
+    # ----- Extra Validation 2: 事件 teacher detector + 最终 encoder → 评估 event -----
+    print("\n" + "=" * 60)
+    print("Extra Validation 2: 事件 teacher detector + 最终 encoder (评估事件)")
+    print("=" * 60)
 
-    results_teacher_head_final = eval_event_with_external_detector(
+    results_dict_xv2 = eval_event_with_external_detector(
         encoder_model=student,
         external_detector=teacher_event_detector,
-        testload=val_loader,
+        testload=val_loader_event,
         gpu=GPU,
     )
-    print(f"✅ Extra Validation 2 collected predictions for {len(results_teacher_head_final)} videos")
-
-    eval_res_teacher_head_final = evaluate_multi_thresholds(
-        results_teacher_head_final,
-        anno_root_path=args.annotation_path,
+    eval_res_xv2, ev_f1_xv2 = evaluate_multi_thresholds(
+        results_dict_xv2, anno_root_path=args_eval.annotation_path,
         thresholds=[0.10, 0.20, 0.30, 0.40, 0.50],
         rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
-        step_frames=1,
-        log_tag='event_eval_teacher_head_final',
+        step_frames=1, log_tag='stage3_extraval_event'
     )
-    extra_val2_record = {
-    "stage": "extra_validation_2_teacher_detector_plus_final_encoder",
-    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "num_videos": len(results_teacher_head_final),
-    "results": eval_res_teacher_head_final,
-    }
+    print(f"[ExtraVal2] event F1@0.10 (teacher head + final encoder) = {ev_f1_xv2:.4f}")
 
     save_json(
-    extra_val2_record,
-    os.path.join(CKPT_DIR, "extra_validation_2_teacher_head_final.json")
+        {
+            "stage": "extra_validation_2_event_detector_plus_final_encoder",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "f1_at_0.10_global_avg": ev_f1_xv2,
+            "results": eval_res_xv2,
+        },
+        os.path.join(CKPT_DIR, "extra_validation_2_event_head_final.json")
     )
-    print("\n🎯 All training and evaluation done!")
+
+    print(f"\n[Stage 3 DONE] Best Stage3 event F1@0.10 = {best_stage3_f1}")
+    print(f"               Saved: {EVENT_HEAD_BEST_PATH}")
+    print(f"               Checkpoints dir: {CKPT_DIR}")
+
+
+# =========================
+# Entry
+# =========================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Event-First three-stage independent training (Event -> Scene -> Event)"
+    )
+    parser.add_argument('--stage', type=int, required=True, choices=[1, 2, 3],
+                        help="1: Event-Only / 2: Scene+EventTeacher+Adv / 3: Frozen+New FrameWiseHead")
+    args = parser.parse_args()
+
+    if args.stage == 1:
+        run_stage1()
+    elif args.stage == 2:
+        run_stage2()
+    elif args.stage == 3:
+        run_stage3()
 
 
 if __name__ == '__main__':

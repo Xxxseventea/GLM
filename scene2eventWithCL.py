@@ -1,22 +1,17 @@
-
-"""
-scene2event_schemeA_fixed.py
------------------------------
-终身学习 (Scene→Event)
-- 新域: Event (Kinetics)
-- 旧域: Scene (MovieNet)
-包含: Teacher(冻结Scene), Student(Event head), Feature Distillation + Domain Adversarial
-"""
-
-import os
 import argparse
+import os
+from typing import Optional, Tuple
+from collections import defaultdict
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+import json
+from datetime import datetime
 
+# ======== 根据你的工程结构调整这些 import ========
 from model.backbone.RelationNet import LocalUncertaintyAwareGraphAttentionLite
 from model.detector.scene_detector import MlpHead
 from model.detector.event_detector import FrameWiseHead
@@ -24,1021 +19,972 @@ from model.discriminator.discriminator import TemporalDiscriminator
 from dataset.movienet.load_movienet_server import load_data
 from dataset.kinetics.dataset import build as build_kinetics, collate_fn
 from tool.warmup_lr import warmup_decay_cosine
+from tool.metric.scene_metric import metric
+from tool.metric.kinetics_metric import (
+    save_submission_in_seconds_multi_thresh,
+    eval_by_frame_metric_from_seconds_map,
+    summarize_global_avg_over_thresholds,
+)
+# =================================================
 
-# ====================
+
+# =========================
 # Config
-# ====================
-DEVICE = "cuda:0"
-EPOCHS = 20
+# =========================
+SCENE_PRETRAIN_EPOCHS = 5    # Phase 0: 场景预训练，挑出最佳场景 ckpt
+EVENT_TRAIN_EPOCHS    = 5    # Phase 1: 事件训练 (基于最佳场景 ckpt + 场景 KD + adv)
+SCENE_HEAD_EPOCHS     = 20   # Phase 2: 冻结 backbone，恢复场景头
 BATCH_SIZE = 128
 T = 21
-ALPHA_FEAT = 0.5
-LAMBDA_ADV = 0.1
-LR = 1e-4
-EVENT_KEEP_RATIO = 0.7
-SCENE_KEEP_RATIO = 0.3
-
-CKPT_SCENE = "/home/tianxiaoxuan/data/mamba/checkpoint_scene/epoch_004.pt"
-OUT_DIR = "/home/tianxiaoxuan/data/mamba/checkpoint_sceneWithCL"
-os.makedirs(OUT_DIR, exist_ok=True)
-from tool.metric.scene_metric_backup import metric as scene_metric
-# Scene dataset
-IMG_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl'
-PLC_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl'
-LABEL_PATH = '/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl'
-SPLIT_PATH_SCENE = '/home/tianxiaoxuan/data/mamba/data/split318.json'
-MAMBA_PATH = '/home/tianxiaoxuan/data/mamba/data/ImageNet_shot.pkl'
-
-# Event dataset
-KINETICS_PATH = {
-    "feature_path": "/data/shared_dataset/Kinetics/features",
-    "annotation_path": "/data/shared_dataset/Kinetics/data",
-    "score_path": "/data/shared_dataset/Kinetics/data",
-}
+GPU = 0
+DEVICE = f"cuda:{GPU}"
 
 
-# ============== EncoderHook ==============
+movienet_dataset_path = "/mnt/MovieNet/"
+kinetics_dataset_path = "/root/autodl-tmp/Kinetics/"
+IMG_PATH         = movienet_dataset_path + 'ImageNet_shot.pkl'
+PLC_PATH         = movienet_dataset_path + 'Places_shot.pkl'
+LABEL_PATH       = movienet_dataset_path + 'label_endShot.pkl'
+SPLIT_PATH_SCENE = movienet_dataset_path + 'split318.json'
+MAMBA_PATH       = IMG_PATH
+
+# 输出目录：scene-first + WithCL_L_G 实验,放到 autodl-fs
+CKPT_DIR = '/root/autodl-fs/mamba/checkpoint_scene/SceneFirst_WithCL_L_G'
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+# Phase 1 超参
+ALPHA_FEAT       = 0.5    # 特征蒸馏权重
+LAMBDA_ADV       = 0.1    # 域对抗权重 (通过 GRL)
+SCENE_KEEP_RATIO = 1.0    # Phase 0 用：场景预训练抽样比例
+EVENT_KEEP_RATIO = 1.0    # Phase 1 主任务：事件抽样比例
+SCENE_AUX_RATIO  = 0.30   # Phase 1 辅助：场景仅供域对抗使用
+USE_PROJ_TO_TEACHER = False
+
+
+# =========================
+# 工具函数
+# =========================
+def to_serializable(obj):
+    if isinstance(obj, dict):
+        return {str(k): to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [to_serializable(v) for v in obj]
+    elif isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    else:
+        return obj
+
+
+def save_json(data, json_path):
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(to_serializable(data), f, ensure_ascii=False, indent=2)
+
+
+def build_center_reg_labels_from_relative_targets(targets_list):
+    B = len(targets_list)
+    device = (targets_list[0]['boundaries'].device
+              if torch.is_tensor(targets_list[0]['boundaries'])
+              else torch.device('cpu'))
+
+    cls_label = torch.zeros(B, dtype=torch.float32, device=device)
+    center_gt = torch.full((B,), 0.5, dtype=torch.float32, device=device)
+    has_pos   = torch.zeros(B, dtype=torch.bool, device=device)
+    vid_ids   = []
+
+    for i, t in enumerate(targets_list):
+        vid_tensor = t.get('video_id', None)
+        vid = int(vid_tensor.item()) if torch.is_tensor(vid_tensor) else (vid_tensor if vid_tensor is not None else i)
+        vid_ids.append(str(vid))
+
+        y = t['boundaries']
+        if y.numel() > 0:
+            cls_label[i] = 1.0
+            idx = torch.argmin(torch.abs(y - 0.5))
+            center_gt[i] = y[idx]
+            has_pos[i] = True
+        else:
+            cls_label[i] = 0.0
+
+    return cls_label, center_gt, has_pos, vid_ids
+
+
+def extract_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            return ckpt["state_dict"]
+        if "model" in ckpt and isinstance(ckpt["model"], dict):
+            return ckpt["model"]
+    return ckpt
+
+
+def strip_module_prefix(sd: dict):
+    return {
+        (k.replace("module.", "", 1) if k.startswith("module.") else k): v
+        for k, v in sd.items()
+    }
+
+
+def load_backbone_only(model: nn.Module, ckpt_path: str, detector_prefix: str = "detector."):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = extract_state_dict(ckpt)
+    sd = strip_module_prefix(sd)
+    pruned = {k: v for k, v in sd.items() if not k.startswith(detector_prefix)}
+    load_info = model.load_state_dict(pruned, strict=False)
+    print("Backbone-only load -> Missing keys:", load_info.missing_keys)
+    print("Backbone-only load -> Unexpected keys:", load_info.unexpected_keys)
+    print("Loaded params:", len(pruned))
+    return load_info
+
+
+# =========================
+# Hook: 截取 detector 之前的 encoder 表征 z
+# =========================
 class EncoderPreHook:
     def __init__(self, model_with_head: nn.Module):
         self.z = None
         def pre_hook(module, inputs):
             z = inputs[0]
             self.z = z.mean(dim=1) if z.dim() == 3 else z
-        self.h = model_with_head.detector.register_forward_pre_hook(lambda m, i: pre_hook(m, i))
+        self.h = model_with_head.detector.register_forward_pre_hook(lambda m, inp: pre_hook(m, inp))
+
     def close(self):
-        self.h.remove()
+        try:
+            self.h.remove()
+        except Exception:
+            pass
 
 
-# ============== Data ==============
-def build_subset_loader_event(keep_ratio, batch_size, seg_sz, device):
-    args = argparse.Namespace()
-    args.feature_path = KINETICS_PATH["feature_path"]
-    args.annotation_path = KINETICS_PATH["annotation_path"]
-    args.score_path = KINETICS_PATH["score_path"]
-    args.window_size = seg_sz
-    args.interval = 1
-    args.device = device
-    dataset_full = build_kinetics(split='train', args=args)
-    N = len(dataset_full)
-    keep = max(1, int(N * keep_ratio))
-    subset = Subset(dataset_full, torch.randperm(N)[:keep].tolist())
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
-                        collate_fn=collate_fn, num_workers=4, pin_memory=True, drop_last=True)
-    print(f"[Event] subset {keep}/{N} ({keep/N:.1%})")
-    return loader
-
-
-def build_subset_loader_scene(split_json, keep_ratio, batch_size, seg_sz):
-    full_loader = load_data(LABEL_PATH, IMG_PATH, PLC_PATH,  split_json,
-                            batch_size, seg_sz=seg_sz, mode1='train', mode2=None)
-    dataset = full_loader.dataset
-    N = len(dataset)
-    keep = max(1, int(N * keep_ratio))
-    subset = Subset(dataset, torch.randperm(N)[:keep].tolist())
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=True, num_workers=4,
-                        pin_memory=True, drop_last=True)
-    print(f"[Scene] subset {keep}/{N} ({keep/N:.1%})")
-    return loader
-
-
-# ============== Teacher/Student ==============
-def build_teacher(scene_ckpt: str, device=DEVICE):
-    teacher = LocalUncertaintyAwareGraphAttentionLite(
-        dim_in=2048, num_heads=8, window_size=5, sim_temperature=0.07,
-        neighbor_temp=0.5, uncertainty_mode="variance", use_relative_pos_bias=True,
-        norm="ln", size=T).to(device)
-    ckpt = torch.load(scene_ckpt, map_location="cpu")
-    sd = ckpt.get("model", ckpt)
-    pruned = {k: v for k, v in sd.items() if not k.startswith("detector.")}
-    teacher.load_state_dict(pruned, strict=False)
-    teacher.detector = MlpHead(in_dim=2176, hid_dim=512, out_dim=1).to(device)
-    for p in teacher.parameters(): p.requires_grad_(False)
-    teacher.eval()
-    hook = EncoderPreHook(teacher)
-    print("🧑‍🏫 Teacher(Scene) loaded.")
-    return teacher, hook, 2176
-
-
-def build_student(device=DEVICE):
-    student = LocalUncertaintyAwareGraphAttentionLite(
-        dim_in=2048, num_heads=8, window_size=5, sim_temperature=0.07,
-        neighbor_temp=0.5, uncertainty_mode="variance", use_relative_pos_bias=True,
-        norm="ln", size=T).to(device)
-    student.detector = FrameWiseHead(in_features=2176).to(device)
-    hook = EncoderPreHook(student)
-    print("🧠 Student(Event head) initialized.")
-    return student, hook, 2176
-
-
-# ============== GRL ==============
+# =========================
+# GRL
+# =========================
 class GradReverse(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lambd):
         ctx.lambd = lambd
         return x.view_as(x)
+
     @staticmethod
     def backward(ctx, grad_output):
         return -ctx.lambd * grad_output, None
 
 
-# ============== Training ==============
+def grad_reverse(x, lambd=1.0):
+    return GradReverse.apply(x, lambd)
+
+
+# =========================
+# Build encoder/student/teacher (Mamba 完整版)
+# =========================
+def build_encoder(device=DEVICE, dim_in=2048, num_heads=8, window_size=5, size=21):
+    return LocalUncertaintyAwareGraphAttentionLite(
+        dim_in=dim_in,
+        num_heads=num_heads,
+        window_size=window_size,
+        sim_temperature=0.07,
+        neighbor_temp=0.5,
+        uncertainty_mode="variance",
+        use_relative_pos_bias=True,
+        norm="ln",
+        size=size,
+    ).to(device)
+
+
+def build_student_with_scene_head(device=DEVICE, size=T, mlp_hid=512, mlp_out=1):
+    """Phase 0: encoder + MlpHead, 从头训场景。"""
+    student = build_encoder(device=device, size=size)
+    student.detector = MlpHead(in_dim=2176, hid_dim=mlp_hid, out_dim=mlp_out).to(device)
+    hook = EncoderPreHook(student)
+    return student, hook, 2176
+
+
+def build_student_with_event_head_from_scene_ckpt(scene_ckpt_path, device=DEVICE, size=T):
+    """Phase 1: encoder ← 最佳场景 ckpt; detector = FrameWiseHead。"""
+    student = build_encoder(device=device, size=size)
+    student.detector = FrameWiseHead(in_features=2176).to(device)
+    load_backbone_only(student, scene_ckpt_path, detector_prefix="detector.")
+    print("✅ Student backbone initialized from best scene ckpt; detector = FrameWiseHead")
+    hook = EncoderPreHook(student)
+    return student, hook, 2176
+
+
+def build_teacher_encoder_from_scene_ckpt(ckpt_path, device=DEVICE, size=T):
+    """Phase 1: teacher encoder ← 最佳场景 ckpt (frozen)。"""
+    teacher = build_encoder(device=device, size=size)
+    load_backbone_only(teacher, ckpt_path, detector_prefix="detector.")
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher.eval()
+    teacher.detector = nn.Identity().to(device)
+    hook = EncoderPreHook(teacher)
+    return teacher, hook, 2176
+
+
+def build_teacher_scene_detector_from_ckpt(ckpt_path, device=DEVICE,
+                                           in_dim=2176, hid_dim=512, out_dim=1):
+    """从最佳场景 ckpt 提取 MlpHead 作为冻结的场景检测头 (用于 cross-task 验证)。"""
+    head = MlpHead(in_dim=in_dim, hid_dim=hid_dim, out_dim=out_dim).to(device)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = extract_state_dict(ckpt)
+    sd = strip_module_prefix(sd)
+    head_sd = {
+        k.replace("detector.", "", 1): v
+        for k, v in sd.items() if k.startswith("detector.")
+    }
+    info = head.load_state_dict(head_sd, strict=False)
+    print("Teacher scene detector load -> Missing:", info.missing_keys)
+    print("Teacher scene detector load -> Unexpected:", info.unexpected_keys)
+    print("Loaded scene-head params:", len(head_sd))
+    head.eval()
+    for p in head.parameters():
+        p.requires_grad_(False)
+    return head
+
+
+# =========================
+# Data helpers
+# =========================
+def build_subset_loader_scene(split_json, keep_ratio, batch_size, seg_sz, mode='train'):
+    full_loader = load_data(
+        LABEL_PATH, IMG_PATH, PLC_PATH, split_json,
+        batch_size, seg_sz=seg_sz, mode1=mode
+    )
+    dataset = full_loader.dataset
+    N = len(dataset)
+    if keep_ratio >= 1.0:
+        return full_loader, N, N
+    keep = max(1, int(N * keep_ratio))
+    indices = torch.randperm(N)[:keep].tolist()
+    subset = torch.utils.data.Subset(dataset, indices)
+    loader = torch.utils.data.DataLoader(
+        subset, batch_size=batch_size, shuffle=True, num_workers=2,
+        pin_memory=False, drop_last=True
+    )
+    return loader, keep, N
+
+
+def build_subset_loader_event(keep_ratio, batch_size, seg_sz, device=DEVICE):
+    args = argparse.Namespace()
+    args.feature_path    = kinetics_dataset_path + "features"
+    args.score_path      = kinetics_dataset_path + "data"
+    args.annotation_path = kinetics_dataset_path + "data"
+    args.window_size     = seg_sz
+    args.interval        = 1
+    args.device          = device
+
+    dataset_full = build_kinetics(split='train', args=args)
+    N = len(dataset_full)
+    if keep_ratio >= 1.0:
+        loader = torch.utils.data.DataLoader(
+            dataset_full, batch_size=batch_size, shuffle=True,
+            collate_fn=collate_fn, num_workers=2,
+            pin_memory=False, drop_last=True
+        )
+        print(f"[Event (Kinetics)] full: {N}")
+        return loader, N, N
+
+    keep = max(1, int(N * keep_ratio))
+    indices = torch.randperm(N)[:keep].tolist()
+    subset = torch.utils.data.Subset(dataset_full, indices)
+    loader = torch.utils.data.DataLoader(
+        subset, batch_size=batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=2,
+        pin_memory=False, drop_last=True
+    )
+    print(f"[Event (Kinetics)] subset: {keep}/{N} ({keep/N:.1%})")
+    return loader, keep, N
+
+
 def paired_iter(loader_a, loader_b):
     ita, itb = iter(loader_a), iter(loader_b)
     while True:
         try:
-            a = next(ita)
+            ba = next(ita)
         except StopIteration:
-            ita = iter(loader_a); a = next(ita)
+            ita = iter(loader_a)
+            ba = next(ita)
         try:
-            b = next(itb)
+            bb = next(itb)
         except StopIteration:
-            itb = iter(loader_b); b = next(itb)
-        yield a, b
+            itb = iter(loader_b)
+            bb = next(itb)
+        yield ba, bb
 
 
-# ===============================================================
-# Scene Head 训练 & 评估
-# ===============================================================
-def train_one_epoch(scene_loader, model, optimizer, scheduler, criterion, gpu=0, epoch=1):
-    """scene_head 单次训练(一轮)"""
-    model.train().cuda(gpu)
-    epoch_loss = 0.0
-    for batch_idx, batch in enumerate(tqdm(scene_loader, desc=f"🎯 Train Scene Epoch {epoch}")):
-        names, img_ctx, plc_ctx, label, pos, ids, ind = batch = batch
-        img_ctx, plc_ctx, label = img_ctx.cuda(gpu), plc_ctx.cuda(gpu), label.float().cuda(gpu)
+# =========================
+# PHASE 0: 场景独立预训练
+# =========================
+def train_epoch_scene_only(train_loader_scene, student, opti, lr_sh=None, device=DEVICE):
+    student.train().to(device)
+    bce = nn.BCEWithLogitsLoss()
+    pbar = tqdm(train_loader_scene, desc="Phase 0: Train(Scene only)")
 
-        optimizer.zero_grad()
-        x = 0.7 * img_ctx + 0.3 * plc_ctx
-        logtics, pred = model(x)
-        loss = criterion(logtics.squeeze(), label)
+    for sample in pbar:
+        name, img_s, plc_s, label_s, pos, _, _ = sample
+        img_s   = img_s.to(device, non_blocking=True)
+        plc_s   = plc_s.to(device, non_blocking=True)
+        label_s = label_s.to(device, non_blocking=True).float()
+        w = 0.7
+        x = w * img_s + (1 - w) * plc_s
+
+        opti.zero_grad(set_to_none=True)
+        logits, _ = student(x)
+        logits = logits.squeeze(-1)
+        loss = bce(logits, label_s)
         loss.backward()
-        optimizer.step()
-        scheduler.step()
-        epoch_loss += loss.item()
+        opti.step()
+        if lr_sh is not None:
+            lr_sh.step()
 
-    avg_loss = epoch_loss / len(scene_loader)
-    lr = scheduler.get_last_lr()[0]
-    print(f"[Scene Train] Epoch {epoch}: Loss={avg_loss:.4f}, LR={lr:.6f}")
-    return avg_loss
+        pbar.set_postfix(loss=float(loss.item()))
 
 
-@torch.no_grad()
-def evaluate_scene(scene_loader, model, gpu=0):
-    """Scene Head 推理并计算 metric"""
-    model.eval().cuda(gpu)
-    predlist, labelist, pathlist = [], [], []
-    for batch in tqdm(scene_loader, desc="Scene Eval"):
-        names, img_ctx, plc_ctx, label, pos, ids, ind = batch = batch
-        img_ctx, plc_ctx = img_ctx.cuda(gpu), plc_ctx.cuda(gpu)
-        x = 0.7 * img_ctx + 0.3 * plc_ctx
-        _, pred = model(x)
-        predlist.append(pred.cpu().numpy())
-        labelist.append(label.numpy())
-        pathlist.append(names)
-    met, moviePL = scene_metric(pathlist, predlist, labelist)
-    return met
-def train_epoch_schemeA(event_loader, scene_loader,
-                        student, stu_hook, teacher, tea_hook, disc,
-                        opt_main, opt_disc, sch_main=None, sch_disc=None,
-                        device=DEVICE, alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV):
-
+# =========================
+# PHASE 1 训练函数 - 三个变体
+#   - 主任务: 事件 BCE        (新域 = 事件)
+#   - 辅助:  场景             (旧域,仅供域对抗)
+#   - Teacher: 来自最佳场景 ckpt 的 encoder (frozen)
+# =========================
+def _phase1_event_with_scene_teacher_core(
+    train_loader_event: DataLoader,
+    train_loader_scene_aux: DataLoader,
+    student, stu_hook, stu_z_dim,
+    teacher, tea_hook, tea_z_dim,
+    disc,
+    opt_main, opt_disc,
+    lr_sh_main, lr_sh_disc,
+    device, alpha_feat, lambda_adv, proj_to_teacher,
+    update_global_disc: bool,
+    desc: str,
+):
     student.train().to(device)
     teacher.eval().to(device)
     disc.train().to(device)
-    bce = nn.BCEWithLogitsLoss()
 
-    it = paired_iter(event_loader, scene_loader)
-    pbar = tqdm(range(len(event_loader)), desc="Train SchemeA(Event70 + Scene30)")
+    proj = nn.Identity().to(device)
+    if proj_to_teacher or (stu_z_dim != tea_z_dim):
+        proj = nn.Linear(stu_z_dim, tea_z_dim, bias=False).to(device)
+
+    it = paired_iter(train_loader_event, train_loader_scene_aux)
+    pbar = tqdm(range(len(train_loader_event)), desc=desc)
 
     for _ in pbar:
         batch_event, batch_scene = next(it)
-        # ----- Event batch (new domain)
-        locations, features, targets_list, _, _, _ = batch_event
-        features = features.to(device)
-        label_e = torch.tensor([1.0 if t["boundaries"].numel() > 0 else 0.0
-                                for t in targets_list], dtype=torch.float32, device=device)
+        (locations, features, targets_list, num_frames, base, coherence) = batch_event
+        (name, img_s, plc_s, label_s, pos, _, _) = batch_scene
 
-        # ----- Scene batch (old domain)
-        _, img_s, plc_s,  label_s, _, _, _ = batch_scene
-        img_s, plc_s = img_s.to(device), plc_s.to(device)
+        features = features.cuda(device, non_blocking=True)
+        cls_label, center_gt, has_pos, _ = build_center_reg_labels_from_relative_targets(targets_list)
+        cls_label = cls_label.cuda(device, non_blocking=True)
+
+        img_s = img_s.to(device, non_blocking=True)
+        plc_s = plc_s.to(device, non_blocking=True)
         w = 0.7
-        x_old = w * img_s + (1 - w) * plc_s
-        x_new = features
+        x_old = w * img_s + (1 - w) * plc_s   # 旧域 = 场景
+        x_new = features                       # 新域 = 事件
 
-        # (1) 更新判别器
-        opt_disc.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            _ = student(x_new); z_new = stu_hook.z.detach()
-            _ = student(x_old); z_old = stu_hook.z.detach()
-        z_dom = torch.cat([z_old, z_new], dim=0)
-        y_dom = torch.cat([torch.zeros(z_old.size(0),1,device=device),
-                           torch.ones(z_new.size(0),1,device=device)], 0)
-        logit_d = disc(z_dom)
-        loss_disc = F.binary_cross_entropy_with_logits(logit_d, y_dom)
-        loss_disc.backward(); opt_disc.step()
-        if sch_disc is not None: sch_disc.step()
+        # 1) 全局判别器更新 (可选, 对应 abs_wo_global_disc 消融)
+        loss_disc_val = None
+        if update_global_disc:
+            opt_disc.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                _ = student(x_new)
+                z_new = stu_hook.z.detach()
+                _ = student(x_old)
+                z_old = stu_hook.z.detach()
+            x_dom = torch.cat([z_old, z_new], dim=0)
+            y_dom = torch.cat([
+                torch.zeros(z_old.size(0), 1, device=device),
+                torch.ones(z_new.size(0), 1, device=device),
+            ], dim=0)
+            logit_d = disc(x_dom)
+            loss_disc = F.binary_cross_entropy_with_logits(logit_d, y_dom)
+            loss_disc.backward()
+            opt_disc.step()
+            loss_disc_val = float(loss_disc.item())
+        if lr_sh_disc is not None:
+            lr_sh_disc.step()
 
-        # (2) 更新学生
+        # 2) 更新学生
         opt_main.zero_grad(set_to_none=True)
-        sc_new, _ = student(x_new)
-        loss_task = bce(sc_new.squeeze(), label_e)
 
+        # 主任务：事件 BCE (新域)
+        score_logit, center_pred = student(x_new)
+        loss_task = F.binary_cross_entropy_with_logits(score_logit, cls_label.float())
+
+        # 特征蒸馏：在新域(event)输入上,让 student encoder 仍贴近 scene-pretrained teacher
         with torch.no_grad():
-            _ = teacher(x_new); z_t = tea_hook.z
-        _ = student(x_new); z_s = stu_hook.z
-        loss_feat = F.mse_loss(z_s, z_t)
+            _ = teacher(x_new)
+            z_t_new = tea_hook.z
+        _ = student(x_new)
+        z_s_new = stu_hook.z
+        z_s_new_proj = proj(z_s_new)
+        loss_feat = F.mse_loss(z_s_new_proj, z_t_new)
 
-        _ = student(x_old); z_old_s = stu_hook.z
-        z_all = torch.cat([z_old_s, z_s], dim=0)
-        y_all = torch.cat([torch.zeros(z_old_s.size(0),1,device=device),
-                           torch.ones(z_s.size(0),1,device=device)],0)
-        logits_adv = disc(GradReverse.apply(z_all, 1.0))
+        # 域对抗 (GRL)
+        _ = student(x_old)
+        z_s_old = stu_hook.z
+        z_all = torch.cat([z_s_old, z_s_new], dim=0)
+        y_all = torch.cat([
+            torch.zeros(z_s_old.size(0), 1, device=device),
+            torch.ones(z_s_new.size(0), 1, device=device),
+        ], dim=0)
+        logits_adv = disc(grad_reverse(z_all, lambd=1.0))
         loss_adv = F.binary_cross_entropy_with_logits(logits_adv, y_all)
 
-        loss_total = loss_task + alpha_feat * loss_feat - lambda_adv * loss_adv
-        loss_total.backward(); opt_main.step()
-        if sch_main is not None: sch_main.step()
+        loss_total = loss_task + alpha_feat * loss_feat + lambda_adv * loss_adv
+        loss_total.backward()
+        opt_main.step()
+        if lr_sh_main is not None:
+            lr_sh_main.step()
 
-        pbar.set_postfix(task=loss_task.item(), feat=loss_feat.item(),
-                         adv=loss_adv.item(), disc=loss_disc.item())
+        postfix = dict(
+            task=float(loss_task.item()),
+            feat=float(loss_feat.item()),
+            adv=float(loss_adv.item()),
+            total=float(loss_total.item()),
+        )
+        if loss_disc_val is not None:
+            postfix['d'] = loss_disc_val
+        pbar.set_postfix(**postfix)
 
 
-# ============== main ==============
+def train_epoch_schemeA_mixed(
+    train_loader_event, train_loader_scene_aux,
+    student, stu_hook, stu_z_dim,
+    teacher, tea_hook, tea_z_dim,
+    disc, opt_main, opt_disc,
+    lr_sh_main=None, lr_sh_disc=None,
+    device=DEVICE, alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV,
+    proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
+):
+    """完整方案A：全局 disc 更新 + GRL adv + 场景特征蒸馏。"""
+    _phase1_event_with_scene_teacher_core(
+        train_loader_event, train_loader_scene_aux,
+        student, stu_hook, stu_z_dim,
+        teacher, tea_hook, tea_z_dim,
+        disc, opt_main, opt_disc,
+        lr_sh_main, lr_sh_disc,
+        device, alpha_feat, lambda_adv, proj_to_teacher,
+        update_global_disc=True,
+        desc="Phase 1 [Full]: Event + Scene KD + GlobalDisc + GRL",
+    )
+
+
+def train_epoch_abs_wo_global_disc(
+    train_loader_event, train_loader_scene_aux,
+    student, stu_hook, stu_z_dim,
+    teacher, tea_hook, tea_z_dim,
+    disc, opt_main, opt_disc,
+    lr_sh_main=None, lr_sh_disc=None,
+    device=DEVICE, alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV,
+    proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
+):
+    """消融：不更新全局 disc,但保留 GRL 对抗。(默认调用此版,匹配你原 main)"""
+    _phase1_event_with_scene_teacher_core(
+        train_loader_event, train_loader_scene_aux,
+        student, stu_hook, stu_z_dim,
+        teacher, tea_hook, tea_z_dim,
+        disc, opt_main, opt_disc,
+        lr_sh_main, lr_sh_disc,
+        device, alpha_feat, lambda_adv, proj_to_teacher,
+        update_global_disc=False,
+        desc="Phase 1 [WoGlobalDisc]: Event + Scene KD + GRL only",
+    )
+
+
+def train_epoch_abs_wo_disc(
+    train_loader_event, train_loader_scene_aux,
+    student, stu_hook, stu_z_dim,
+    teacher, tea_hook, tea_z_dim,
+    disc, opt_main, opt_disc,
+    lr_sh_main=None, lr_sh_disc=None,
+    device=DEVICE, alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV,
+    proj_to_teacher: bool = USE_PROJ_TO_TEACHER,
+):
+    """与 wo_global_disc 同 (你原文件里这两个本来就是同一份, 保留接口一致)。"""
+    _phase1_event_with_scene_teacher_core(
+        train_loader_event, train_loader_scene_aux,
+        student, stu_hook, stu_z_dim,
+        teacher, tea_hook, tea_z_dim,
+        disc, opt_main, opt_disc,
+        lr_sh_main, lr_sh_disc,
+        device, alpha_feat, lambda_adv, proj_to_teacher,
+        update_global_disc=False,
+        desc="Phase 1 [WoDisc]: Event + Scene KD + GRL only",
+    )
+
+
+# =========================
+# PHASE 2: 冻结 backbone, 只训新的 MlpHead
+# =========================
+def train_epoch_scene_head_only(train_loader, model, opti, lr_sh=None, device=DEVICE):
+    model.train().to(device)
+    bce = nn.BCEWithLogitsLoss()
+    progress = tqdm(train_loader, desc="Phase 2: Train(Scene head only)")
+    for sample in progress:
+        name, img_s, plc_s, label_s, pos, _, _ = sample
+        img_s   = img_s.to(device, non_blocking=True)
+        plc_s   = plc_s.to(device, non_blocking=True)
+        label_s = label_s.to(device, non_blocking=True).float()
+        w = 0.7
+        x = w * img_s + (1 - w) * plc_s
+        opti.zero_grad(set_to_none=True)
+        logits, _ = model(x)
+        logits = logits.squeeze(-1)
+        loss = bce(logits, label_s)
+        loss.backward()
+        opti.step()
+        if lr_sh is not None:
+            lr_sh.step()
+        progress.set_postfix(loss=float(loss.item()))
+
+
+# =========================
+# Eval
+# =========================
+@torch.no_grad()
+def eval_epoch_scene(test_loader, model, device=DEVICE):
+    model.eval()
+    predlist, labelist, pathlist, idlist = [], [], [], []
+    for sample in tqdm(test_loader, desc="Eval(Scene)"):
+        names, img_ctx, plc_ctx, label, pos, ids, ind = sample
+        img_ctx = img_ctx.to(device, non_blocking=True)
+        plc_ctx = plc_ctx.to(device, non_blocking=True)
+        w = 0.7
+        x = w * img_ctx + (1 - w) * plc_ctx
+        logits, center = model(x)
+        probs = center.squeeze().cpu().numpy()
+        predlist.append(probs)
+        labelist.append(label.numpy())
+        pathlist.append(names)
+        idlist.append(np.asarray(ind))
+    met, moviePL = metric(pathlist, predlist, labelist)
+    return met, moviePL
+
+
+@torch.no_grad()
+def test_epoch_event(testload, model, gpu=0):
+    model.eval().cuda(gpu)
+    results_dict = defaultdict(list)
+    for batch in tqdm(testload, desc="Evaluate(Event Dataset)"):
+        locations, features, targets_list, num_frames, base, coherence = batch
+        B, L, _ = features.shape
+        features = features.cuda(gpu, non_blocking=True)
+        score_logit, center_pred = model(features)
+        probs = torch.sigmoid(score_logit)
+
+        base_b = base.view(-1).to(features.device).float()
+        loc = locations.to(features.device).float()
+        t = center_pred.clamp(0, 1) * (L - 1)
+        lo = t.floor().long().clamp(0, L - 1)
+        hi = (lo + 1).clamp(0, L - 1)
+        w = (t - lo.float())
+        rel_lo = loc[torch.arange(B), lo, 0]
+        rel_hi = loc[torch.arange(B), hi, 0]
+        rel_abs = rel_lo * (1 - w) + rel_hi * w
+        abs_frames = base_b + rel_abs
+
+        for i, tdict in enumerate(targets_list):
+            vid_tensor = tdict.get("video_id", None)
+            vid = (
+                int(vid_tensor.item())
+                if torch.is_tensor(vid_tensor)
+                else (vid_tensor if vid_tensor is not None else i)
+            )
+            vid = str(vid)
+            results_dict[vid].append({
+                "boundaries": abs_frames[i:i+1].detach().cpu(),
+                "scores": probs[i:i+1].detach().cpu(),
+            })
+    return dict(results_dict)
+
+
+def evaluate_multi_thresholds(
+    results,
+    anno_root_path,
+    thresholds=None,
+    rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+    step_frames=1,
+    log_tag="event_eval",
+):
+    """返回 (eval_results, f1@0.10_global_avg)"""
+    if thresholds is None:
+        thresholds = [0.10, 0.20, 0.30, 0.40, 0.50]
+    seconds_map_by_thresh = save_submission_in_seconds_multi_thresh(
+        results, anno_root_path, thresholds,
+        step_frames=step_frames,
+        out_dir=f"{log_tag}_pred_outputs",
+        write_pkls=False, debug=True,
+    )
+    eval_results = eval_by_frame_metric_from_seconds_map(
+        anno_root_path, seconds_map_by_thresh,
+        downsample=1, rel_dist_list=rel_dist_list,
+        filter_low_consis=True, consis_th=0.3, debug=True,
+    )
+    global_avg = summarize_global_avg_over_thresholds(eval_results, d=0.10)
+    print(
+        f"[GLOBAL AVG] F1@0.10={global_avg['f1']:.4f} "
+        f"(Prec={global_avg['precision']:.4f}, Rec={global_avg['recall']:.4f})"
+    )
+    return eval_results, float(global_avg['f1'])
+
+
+@torch.no_grad()
+def eval_scene_with_external_detector(encoder_model, external_detector, test_loader, device=DEVICE):
+    old = encoder_model.detector
+    encoder_model.detector = external_detector
+    try:
+        return eval_epoch_scene(test_loader, encoder_model, device=device)
+    finally:
+        encoder_model.detector = old
+
+
+@torch.no_grad()
+def eval_event_with_external_detector(encoder_model, external_detector, testload, gpu=0):
+    """保留: 临时把 detector 换成 external 做事件评估 (本脚本未使用,留作扩展)。"""
+    old = encoder_model.detector
+    encoder_model.detector = external_detector
+    try:
+        return test_epoch_event(testload, encoder_model, gpu=gpu)
+    finally:
+        encoder_model.detector = old
+
+
+# =========================
+# Main
+# =========================
 def main():
-    teacher, tea_hook, tea_dim = build_teacher(CKPT_SCENE, DEVICE)
-    student, stu_hook, stu_dim = build_student(DEVICE)
-    disc = TemporalDiscriminator(in_dim=stu_dim).to(DEVICE)
+    # 评估 args (Kinetics)
+    args_eval = argparse.Namespace()
+    args_eval.feature_path    = kinetics_dataset_path + "features"
+    args_eval.annotation_path = kinetics_dataset_path + "data"
+    args_eval.score_path      = kinetics_dataset_path + "data"
+    args_eval.window_size     = T
+    args_eval.interval        = 1
+    args_eval.device          = DEVICE
 
-    loader_event = build_subset_loader_event(EVENT_KEEP_RATIO, BATCH_SIZE, T, DEVICE)
-    loader_scene = build_subset_loader_scene(SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T)
+    # ============================================================
+    # PHASE 0: 场景独立预训练 → 找最佳场景 ckpt
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("PHASE 0: 场景独立预训练 (产出最佳场景 ckpt 作为事件训练基础) [Mamba/L_G]")
+    print("=" * 60)
 
-    opt_main = torch.optim.Adam(student.parameters(), lr=LR, betas=(0.9, 0.98), weight_decay=1e-4)
-    opt_disc = torch.optim.Adam(disc.parameters(), lr=LR, betas=(0.9, 0.98), weight_decay=1e-4)
-    sch_main = torch.optim.lr_scheduler.LambdaLR(
-        opt_main, warmup_decay_cosine(len(loader_event), len(loader_event)*(EPOCHS-1)))
-    sch_disc = torch.optim.lr_scheduler.LambdaLR(
-        opt_disc, warmup_decay_cosine(len(loader_event), len(loader_event)*(EPOCHS-1)))
+    train_loader_scene, scene_keep, scene_total = build_subset_loader_scene(
+        SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T, mode='train'
+    )
+    print(f"[Scene-pretrain] subset: {scene_keep}/{scene_total} "
+          f"({scene_keep/scene_total:.1%})")
 
+    test_loader_scene = load_data(
+        LABEL_PATH, IMG_PATH, PLC_PATH, SPLIT_PATH_SCENE,
+        BATCH_SIZE, seg_sz=T, mode1='test'
+    )
 
+    student, stu_hook, stu_z_dim = build_student_with_scene_head(device=DEVICE, size=T)
 
-    train_epoch_schemeA(loader_event, loader_scene,
-                        student, stu_hook, teacher, tea_hook, disc,
-                        opt_main, opt_disc, sch_main, sch_disc, DEVICE)
-    torch.save({"model": student.state_dict(), "epoch": 0},
-               os.path.join(OUT_DIR, f"student_ep0.pth"))
-    # =======================================================
-    # 2️⃣ Scene Head fine-tune & evaluate each epoch
-    # =======================================================
-    print("\n🎞 Fine-tuning Scene Head ...")
-    gpu = 5
+    opt_pretrain = torch.optim.Adam(
+        student.parameters(),
+        lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
+    )
+    n_steps0 = len(train_loader_scene)
+    lr_sh_pretrain = torch.optim.lr_scheduler.LambdaLR(
+        opt_pretrain,
+        warmup_decay_cosine(n_steps0, n_steps0 * max(SCENE_PRETRAIN_EPOCHS - 1, 1))
+    )
 
-    scene_head = MlpHead(in_dim=2176, hid_dim=512).to(f"cuda:{gpu}")
-    for n, p in student.named_parameters():
+    best_scene_score = None
+    best_scene_path  = os.path.join(CKPT_DIR, "scene_pretrain_best.pth")
+
+    for ep in range(SCENE_PRETRAIN_EPOCHS):
+        train_epoch_scene_only(train_loader_scene, student, opt_pretrain,
+                               lr_sh_pretrain, device=DEVICE)
+        met, moviePL = eval_epoch_scene(test_loader_scene, student, device=DEVICE)
+        print(f"[Phase0 Epoch {ep}] scene metric = {met}")
+
+        save_json(
+            {
+                "stage": "phase0_scene_pretrain",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metric": met,
+                "moviePL": moviePL,
+                "scene_subset": {"keep": scene_keep, "total": scene_total,
+                                 "ratio": scene_keep / scene_total},
+            },
+            os.path.join(CKPT_DIR, f"phase0_scene_eval_ep{ep}.json")
+        )
+        torch.save({"model": student.state_dict(), "epoch": ep},
+                   os.path.join(CKPT_DIR, f"phase0_scene_ep{ep}.pth"))
+
+        # 取场景精度最好的 ckpt 作为下游事件训练基础
+        if isinstance(met, dict) and len(met) > 0:
+            key = next(iter(met.keys()))
+            score = float(met[key])
+            if (best_scene_score is None) or (score > best_scene_score):
+                best_scene_score = score
+                torch.save(
+                    {"model": student.state_dict(), "epoch": ep, "metric": met,
+                     "selected_key": key, "selected_score": score},
+                    best_scene_path
+                )
+                print(f"[Phase0] new best scene ({key}={score:.4f}) -> {best_scene_path}")
+
+    print(f"\n[Phase0] DONE. best scene score = {best_scene_score}")
+    print(f"[Phase0] best ckpt -> {best_scene_path}")
+
+    stu_hook.close()
+    del student, opt_pretrain, lr_sh_pretrain
+    torch.cuda.empty_cache()
+
+    # ============================================================
+    # PHASE 1: 事件训练 (基础 = 最佳场景 ckpt) + 场景 KD + 域对抗
+    #   默认调用 train_epoch_abs_wo_global_disc (匹配你原 main 的选择)
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("PHASE 1: 事件训练 (以最佳场景 ckpt 为基础) + 场景 KD + 域对抗 [WoGlobalDisc]")
+    print("=" * 60)
+
+    train_loader_event_main, event_keep, event_total = build_subset_loader_event(
+        EVENT_KEEP_RATIO, BATCH_SIZE, T
+    )
+    train_loader_scene_aux, scene_aux_keep, scene_aux_total = build_subset_loader_scene(
+        SPLIT_PATH_SCENE, SCENE_AUX_RATIO, BATCH_SIZE, T, mode='train'
+    )
+    print(f"[Phase1 Scene-aux] subset: {scene_aux_keep}/{scene_aux_total} "
+          f"({scene_aux_keep/scene_aux_total:.1%})")
+
+    val_dataset_event = build_kinetics(split='val', args=args_eval)
+    val_loader_event = torch.utils.data.DataLoader(
+        val_dataset_event, batch_size=256, shuffle=False,
+        collate_fn=collate_fn, num_workers=0, pin_memory=False
+    )
+
+    # 学生：encoder ← best scene ckpt + FrameWiseHead
+    student, stu_hook, stu_z_dim = build_student_with_event_head_from_scene_ckpt(
+        scene_ckpt_path=best_scene_path, device=DEVICE, size=T
+    )
+
+    # 教师：encoder ← best scene ckpt (frozen)
+    teacher, tea_hook, tea_z_dim = build_teacher_encoder_from_scene_ckpt(
+        ckpt_path=best_scene_path, device=DEVICE, size=T
+    )
+    print("✅ Teacher (scene-pretrained encoder) loaded & frozen")
+
+    # 教师场景 detector (用于 cross-task 验证)
+    teacher_scene_detector = build_teacher_scene_detector_from_ckpt(
+        ckpt_path=best_scene_path, device=DEVICE,
+    )
+    print("✅ Teacher scene detector (MlpHead) loaded & frozen")
+
+    disc = TemporalDiscriminator(in_dim=stu_z_dim).to(DEVICE)
+
+    opt_main = torch.optim.Adam(
+        [p for p in student.parameters() if p.requires_grad],
+        lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
+    )
+    opt_disc = torch.optim.Adam(disc.parameters(), lr=1e-4,
+                                betas=(0.9, 0.98), weight_decay=1e-4)
+
+    n_steps1 = len(train_loader_event_main)
+    lr_sh_main = torch.optim.lr_scheduler.LambdaLR(
+        opt_main, warmup_decay_cosine(n_steps1, n_steps1 * max(EVENT_TRAIN_EPOCHS - 1, 1))
+    )
+    lr_sh_disc = torch.optim.lr_scheduler.LambdaLR(
+        opt_disc, warmup_decay_cosine(n_steps1, n_steps1 * max(EVENT_TRAIN_EPOCHS - 1, 1))
+    )
+
+    best_event_f1   = None
+    best_event_path = os.path.join(CKPT_DIR, "event_best.pth")
+
+    for ep in range(EVENT_TRAIN_EPOCHS):
+        # ↓↓↓ 默认调用 wo_global_disc 消融, 与你原 main 一致;
+        #     想用完整版改成 train_epoch_schemeA_mixed 即可
+        # train_epoch_schemeA_mixed(
+        train_epoch_abs_wo_global_disc(
+            train_loader_event=train_loader_event_main,
+            train_loader_scene_aux=train_loader_scene_aux,
+            student=student, stu_hook=stu_hook, stu_z_dim=stu_z_dim,
+            teacher=teacher, tea_hook=tea_hook, tea_z_dim=tea_z_dim,
+            disc=disc,
+            opt_main=opt_main, opt_disc=opt_disc,
+            lr_sh_main=lr_sh_main, lr_sh_disc=lr_sh_disc,
+            device=DEVICE,
+            alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV,
+            proj_to_teacher=USE_PROJ_TO_TEACHER,
+        )
+
+        # 验证事件
+        results_dict = test_epoch_event(val_loader_event, student, gpu=GPU)
+        eval_res, ev_f1 = evaluate_multi_thresholds(
+            results_dict,
+            anno_root_path=args_eval.annotation_path,
+            thresholds=[0.10, 0.20, 0.30, 0.40, 0.50],
+            rel_dist_list=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+            step_frames=1,
+            log_tag=f'phase1_event_eval_ep{ep}',
+        )
+
+        save_json(
+            {
+                "stage": "phase1_event_training_scene_teacher",
+                "variant": "abs_wo_global_disc",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "num_videos": len(results_dict),
+                "results": eval_res,
+                "f1_at_0.10_global_avg": ev_f1,
+                "scene_aux_subset": {"keep": scene_aux_keep, "total": scene_aux_total,
+                                     "ratio": scene_aux_keep / scene_aux_total},
+                "event_subset":     {"keep": event_keep,     "total": event_total,
+                                     "ratio": event_keep / event_total},
+                "alpha_feat": ALPHA_FEAT,
+                "lambda_adv": LAMBDA_ADV,
+                "best_scene_score_used_as_basis": best_scene_score,
+                "best_scene_ckpt_used_as_basis":  best_scene_path,
+            },
+            os.path.join(CKPT_DIR, f"phase1_event_eval_ep{ep}.json")
+        )
+        torch.save({"model": student.state_dict(), "epoch": ep},
+                   os.path.join(CKPT_DIR, f"phase1_event_ep{ep}.pth"))
+
+        if (best_event_f1 is None) or (ev_f1 > best_event_f1):
+            best_event_f1 = ev_f1
+            torch.save({"model": student.state_dict(), "epoch": ep, "f1": ev_f1},
+                       best_event_path)
+            print(f"[Phase1] new best event F1@0.10={ev_f1:.4f} -> {best_event_path}")
+
+    # ============================================================
+    # Extra Validation 1: 场景 teacher detector + Phase 1 学生 encoder → 评估 scene
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("Extra Validation 1: 场景 teacher detector + Phase 1 学生 encoder (评估场景)")
+    print("=" * 60)
+
+    met_xv1, moviePL_xv1 = eval_scene_with_external_detector(
+        encoder_model=student,
+        external_detector=teacher_scene_detector,
+        test_loader=test_loader_scene,
+        device=DEVICE,
+    )
+    print(f"[ExtraVal1] scene metric on Phase1 encoder = {met_xv1}")
+
+    save_json(
+        {
+            "stage": "extra_validation_1_scene_detector_plus_phase1_encoder",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "metric": met_xv1,
+            "moviePL": moviePL_xv1,
+        },
+        os.path.join(CKPT_DIR, "extra_validation_1_scene_head_phase1.json")
+    )
+
+    # ============================================================
+    # PHASE 2: 冻结 backbone, 重新训场景头 (镜像原 Phase 2)
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("PHASE 2: 冻结 backbone, 仅训新的 MlpHead (恢复场景头)")
+    print("=" * 60)
+
+    for p in student.parameters():
         p.requires_grad = False
-    student.detector = scene_head
+    print("✅ Frozen all student backbone parameters")
+
+    student.detector = MlpHead(in_dim=2176, hid_dim=512, out_dim=1).to(DEVICE)
     for p in student.detector.parameters():
         p.requires_grad = True
+    print("✅ Fresh MlpHead enabled for training")
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(student.detector.parameters(), lr=1e-4,
-                                 betas=(0.9, 0.98), weight_decay=1e-4)
-    total_steps = len(loader_scene) * EPOCHS
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=warmup_decay_cosine(len(loader_scene), total_steps))
+    train_loader_scene_full, _, _ = build_subset_loader_scene(
+        SPLIT_PATH_SCENE, 1.0, BATCH_SIZE, T, mode='train'
+    )
 
-    for ep in range(1, EPOCHS + 1):
-        train_one_epoch(loader_scene, student, optimizer, scheduler, criterion, gpu=gpu, epoch=ep)
-        scene_metrics = evaluate_scene(loader_scene, student, gpu=gpu)
-        print(f"\n[Scene Eval after Epoch {ep}] Metrics: {scene_metrics}")
+    opt_scene_head = torch.optim.Adam(
+        student.detector.parameters(),
+        lr=1e-4, betas=(0.9, 0.98), weight_decay=1e-4
+    )
+    n_steps2 = len(train_loader_scene_full)
+    lr_sh_scene_head = torch.optim.lr_scheduler.LambdaLR(
+        opt_scene_head,
+        warmup_decay_cosine(n_steps2, n_steps2 * max(SCENE_HEAD_EPOCHS - 1, 1))
+    )
 
-    print("\n✅ Training + Evaluation Pipeline Completed.")
+    best_phase2_score = None
+    best_phase2_path  = os.path.join(CKPT_DIR, "scene_head_best.pth")
 
-    print("✅ Scene→Event SchemeA training finished.")
+    for ep in range(SCENE_HEAD_EPOCHS):
+        print(f"\n[Phase2 Scene-head Epoch {ep}]")
+        train_epoch_scene_head_only(
+            train_loader_scene_full, student, opt_scene_head, lr_sh_scene_head, device=DEVICE
+        )
+
+        met, moviePL = eval_epoch_scene(test_loader_scene, student, device=DEVICE)
+        print(f"[Phase2 Epoch {ep}] scene metric = {met}")
+
+        save_json(
+            {
+                "stage": "phase2_scene_head_training",
+                "epoch": ep,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metric": met,
+                "moviePL": moviePL,
+            },
+            os.path.join(CKPT_DIR, f"phase2_scene_eval_ep{ep}.json")
+        )
+        torch.save({"model": student.state_dict(), "epoch": ep},
+                   os.path.join(CKPT_DIR, f"phase2_scene_ep{ep}.pth"))
+
+        if isinstance(met, dict) and len(met) > 0:
+            key = next(iter(met.keys()))
+            score = float(met[key])
+            if (best_phase2_score is None) or (score > best_phase2_score):
+                best_phase2_score = score
+                torch.save({"model": student.state_dict(), "epoch": ep, "metric": met},
+                           best_phase2_path)
+                print(f"[Phase2] new best scene ({key}={score:.4f}) -> {best_phase2_path}")
+
+    # ============================================================
+    # Extra Validation 2: 场景 teacher detector + 最终 encoder → 评估 scene
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("Extra Validation 2: 场景 teacher detector + 最终 encoder (评估场景)")
+    print("=" * 60)
+
+    met_xv2, moviePL_xv2 = eval_scene_with_external_detector(
+        encoder_model=student,
+        external_detector=teacher_scene_detector,
+        test_loader=test_loader_scene,
+        device=DEVICE,
+    )
+    print(f"[ExtraVal2] scene metric (teacher head + final encoder) = {met_xv2}")
+
+    save_json(
+        {
+            "stage": "extra_validation_2_scene_detector_plus_final_encoder",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "metric": met_xv2,
+            "moviePL": moviePL_xv2,
+        },
+        os.path.join(CKPT_DIR, "extra_validation_2_scene_head_final.json")
+    )
+
+    print("\n🎯 All phases done!")
+    print(f"   Phase0 best scene = {best_scene_score}")
+    print(f"   Phase1 best event F1@0.10 = {best_event_f1}")
+    print(f"   Phase2 best scene = {best_phase2_score}")
+    print(f"   ckpt dir: {CKPT_DIR}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
-
-#
-# """
-# scene2event_schemeB_prehook.py
-# -------------------------------
-# 终身学习 (Scene → Event)
-# Scheme B：Event + Scene 联合训练，包含对抗与蒸馏
-# 采用 PreHook（与 Scheme A 相同）方式提取特征，保持判别器维度稳定
-# """
-# import os, torch, argparse
-# from torch import nn
-# import torch.nn.functional as F
-# from torch.utils.data import DataLoader, Subset
-# from tqdm import tqdm
-# from model.backbone.RelationNet import LocalUncertaintyAwareGraphAttentionLite
-# from model.detector.scene_detector import MlpHead
-# from model.detector.event_detector import FrameWiseHead
-# from model.discriminator.discriminator import TemporalDiscriminator
-# from dataset.movienet.load_movienet_server import load_data
-# from dataset.kinetics.dataset import build as build_kinetics, collate_fn
-# from tool.warmup_lr import warmup_decay_cosine
-#
-# # ================= Config =================
-# DEVICE           = "cuda:5"
-# EPOCHS           = 10
-# BATCH_SIZE       = 128
-# T                = 21
-# LR               = 1e-4
-# ALPHA_FEAT       = 0.5
-# LAMBDA_ADV       = 0.1
-# EVENT_KEEP_RATIO = 0.6
-# SCENE_KEEP_RATIO = 0.4
-#
-# CKPT_SCENE = "/home/tianxiaoxuan/data/mamba/checkpoint_scene/epoch_004.pt"
-# OUT_DIR    = "/home/tianxiaoxuan/data/mamba/checkpoint_sceneWithCL"
-# os.makedirs(OUT_DIR, exist_ok=True)
-#
-# IMG_PATH  = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl'
-# PLC_PATH  = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl'
-# LABEL_PATH = '/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl'
-# SPLIT_PATH_SCENE = '/home/tianxiaoxuan/data/mamba/data/split318.json'
-# MAMBA_PATH = '/home/tianxiaoxuan/data/mamba/data/ImageNet_shot.pkl'
-# KINETICS_PATH = {
-#     "feature_path": "/data/shared_dataset/Kinetics/features",
-#     "annotation_path": "/data/shared_dataset/Kinetics/data",
-#     "score_path": "/data/shared_dataset/Kinetics/data",
-# }
-#
-# # ============== EncoderPreHook（与 Scheme A 相同） ==============
-# class EncoderPreHook:
-#     def __init__(self, model_with_head: nn.Module):
-#         self.z = None
-#         def pre_hook(module, inputs):
-#             z = inputs[0]
-#             self.z = z.mean(dim=1) if z.dim() == 3 else z
-#         self.h = model_with_head.detector.register_forward_pre_hook(lambda m, i: pre_hook(m, i))
-#     def close(self):
-#         self.h.remove()
-#
-# # ============== 数据加载 ==============
-# def build_subset_loader_event(keep_ratio,batch_size,seg_sz,device):
-#     args = argparse.Namespace(
-#         feature_path=KINETICS_PATH["feature_path"],
-#         annotation_path=KINETICS_PATH["annotation_path"],
-#         score_path=KINETICS_PATH["score_path"],
-#         window_size=seg_sz, interval=1, device=device)
-#     dataset_full = build_kinetics(split='train', args=args)
-#     N=len(dataset_full); keep=max(1,int(N*keep_ratio))
-#     subset=Subset(dataset_full,torch.randperm(N)[:keep].tolist())
-#     loader=DataLoader(subset,batch_size=batch_size,shuffle=True,collate_fn=collate_fn,
-#                       num_workers=4,pin_memory=True,drop_last=True)
-#     print(f"[Event] subset {keep}/{N} ({keep/N:.1%})")
-#     return loader
-#
-# def build_subset_loader_scene(split_json,keep_ratio,batch_size,seg_sz):
-#     full_loader=load_data(LABEL_PATH,IMG_PATH,PLC_PATH,MAMBA_PATH,split_json,
-#                           batch_size,seg_sz=seg_sz,mode1='train',mode2=None)
-#     dataset=full_loader.dataset; N=len(dataset)
-#     keep=max(1,int(N*keep_ratio))
-#     subset=Subset(dataset,torch.randperm(N)[:keep].tolist())
-#     loader=DataLoader(subset,batch_size=batch_size,shuffle=True,num_workers=4,
-#                       pin_memory=True,drop_last=True)
-#     print(f"[Scene] subset {keep}/{N} ({keep/N:.1%})")
-#     return loader
-#
-# # ============== Teacher / Student ==============
-# def build_teacher(scene_ckpt:str,device=DEVICE):
-#     teacher=LocalUncertaintyAwareGraphAttentionLite(
-#         dim_in=2048,num_heads=8,window_size=5,sim_temperature=0.07,
-#         neighbor_temp=0.5,uncertainty_mode="variance",use_relative_pos_bias=True,
-#         norm="ln",size=T).to(device)
-#     ckpt=torch.load(scene_ckpt,map_location="cpu"); sd=ckpt.get("model",ckpt)
-#     pruned={k:v for k,v in sd.items() if not k.startswith("detector.")}
-#     teacher.load_state_dict(pruned,strict=False)
-#     teacher.detector=MlpHead(in_dim=2176,hid_dim=512,out_dim=1).to(device)
-#     for p in teacher.parameters(): p.requires_grad_(False)
-#     teacher.eval()
-#     hook=EncoderPreHook(teacher)
-#     return teacher,hook,2176
-#
-# def build_student(device=DEVICE):
-#     student=LocalUncertaintyAwareGraphAttentionLite(
-#         dim_in=2048,num_heads=8,window_size=5,sim_temperature=0.07,
-#         neighbor_temp=0.5,uncertainty_mode="variance",use_relative_pos_bias=True,
-#         norm="ln",size=T).to(device)
-#     student.detector=FrameWiseHead(in_features=2176).to(device)
-#     hook=EncoderPreHook(student)
-#     return student,hook,2176
-#
-# # ============== 反向梯度层 ==============
-# class GradReverse(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx,x,lambd):
-#         ctx.lambd=lambd; return x.view_as(x)
-#     @staticmethod
-#     def backward(ctx,grad_output):
-#         return -ctx.lambd*grad_output,None
-#
-# # ============== Data pairing generator ==============
-# def paired_iter(loader_a,loader_b):
-#     ita,itb=iter(loader_a),iter(loader_b)
-#     while True:
-#         try: a=next(ita)
-#         except StopIteration: ita=iter(loader_a); a=next(ita)
-#         try: b=next(itb)
-#         except StopIteration: itb=iter(loader_b); b=next(itb)
-#         yield a,b
-#
-# # ============== 训练逻辑 Scheme B（PreHook） ==============
-# def train_epoch_schemeB(loader_event,loader_scene,
-#                         student,stu_hook,teacher,tea_hook,disc,
-#                         opt_main,opt_disc,sch_main=None,sch_disc=None,
-#                         device=DEVICE,alpha_feat=ALPHA_FEAT,lambda_adv=LAMBDA_ADV):
-#
-#     student.train(); teacher.eval(); disc.train()
-#     bce=nn.BCEWithLogitsLoss()
-#     it=paired_iter(loader_event,loader_scene)
-#     pbar=tqdm(range(len(loader_event)),desc="Scheme B(Event+Scene)")
-#
-#     for _ in pbar:
-#         batch_event,batch_scene=next(it)
-#
-#         # ==== Event domain ====
-#         locations,features,targets_list,_,_,_=batch_event
-#         features=features.to(device)
-#         label_e=torch.tensor([1. if t["boundaries"].numel()>0 else 0.
-#                               for t in targets_list],dtype=torch.float32,device=device)
-#
-#         # ==== Scene domain ====
-#         _,img_s,plc_s,_,label_s,_,_,_=batch_scene
-#         img_s,plc_s=img_s.to(device),plc_s.to(device)
-#         x_s=0.7*img_s+0.3*plc_s
-#         x_e=features
-#
-#         # ===== (1) 判别器更新 =====
-#         opt_disc.zero_grad(set_to_none=True)
-#         with torch.no_grad():
-#             _=student(x_e); z_e=stu_hook.z.detach()
-#             _=student(x_s); z_s=stu_hook.z.detach()
-#         z_dom=torch.cat([z_s,z_e],dim=0)
-#         y_dom=torch.cat([torch.zeros(z_s.size(0),1,device=device),
-#                          torch.ones(z_e.size(0),1,device=device)],0)
-#         out_d=disc(z_dom)
-#         loss_disc=F.binary_cross_entropy_with_logits(out_d,y_dom)
-#         loss_disc.backward(); opt_disc.step()
-#         if sch_disc: sch_disc.step()
-#
-#         # ===== (2) 学生更新 =====
-#         opt_main.zero_grad(set_to_none=True)
-#         sc_e,_=student(x_e)
-#         loss_task=bce(sc_e.squeeze(),label_e)
-#
-#         # Distillation loss
-#         with torch.no_grad():
-#             _=teacher(x_e); z_t=tea_hook.z
-#         _=student(x_e); z_s_new=stu_hook.z
-#         loss_feat=F.mse_loss(z_s_new,z_t)
-#
-#         # Adversarial Loss (GRL)
-#         _=student(x_s); z_s_old=stu_hook.z
-#         z_all=torch.cat([z_s_old,z_s_new],dim=0)
-#         y_all=torch.cat([torch.zeros(z_s_old.size(0),1,device=device),
-#                          torch.ones(z_s_new.size(0),1,device=device)],0)
-#         logits_adv=disc(GradReverse.apply(z_all,1.0))
-#         loss_adv=F.binary_cross_entropy_with_logits(logits_adv,y_all)
-#
-#         loss_total=loss_task+alpha_feat*loss_feat-lambda_adv*loss_adv
-#         loss_total.backward(); opt_main.step()
-#         if sch_main: sch_main.step()
-#
-#         pbar.set_postfix(task=loss_task.item(),feat=loss_feat.item(),
-#                          adv=loss_adv.item(),disc=loss_disc.item())
-#
-# # ============== main ==============
-# def main():
-#     teacher,tea_hook,dim_t=build_teacher(CKPT_SCENE,DEVICE)
-#     student,stu_hook,dim_s=build_student(DEVICE)
-#     disc=TemporalDiscriminator(in_dim=dim_s).to(DEVICE)
-#
-#     loader_event=build_subset_loader_event(EVENT_KEEP_RATIO,BATCH_SIZE,T,DEVICE)
-#     loader_scene=build_subset_loader_scene(SPLIT_PATH_SCENE,SCENE_KEEP_RATIO,BATCH_SIZE,T)
-#
-#     opt_main=torch.optim.Adam(student.parameters(),lr=LR,betas=(0.9,0.98),weight_decay=1e-4)
-#     opt_disc=torch.optim.Adam(disc.parameters(),lr=LR,betas=(0.9,0.98),weight_decay=1e-4)
-#     sch_main=torch.optim.lr_scheduler.LambdaLR(opt_main,
-#         warmup_decay_cosine(len(loader_event),len(loader_event)*(EPOCHS-1)))
-#     sch_disc=torch.optim.lr_scheduler.LambdaLR(opt_disc,
-#         warmup_decay_cosine(len(loader_event),len(loader_event)*(EPOCHS-1)))
-#
-#     for ep in range(EPOCHS):
-#         print(f"\n===== Epoch {ep}/{EPOCHS} =====")
-#         train_epoch_schemeB(loader_event,loader_scene,student,stu_hook,
-#                             teacher,tea_hook,disc,opt_main,opt_disc,
-#                             sch_main,sch_disc,DEVICE)
-#         torch.save({"model":student.state_dict(),"epoch":ep},
-#                    os.path.join(OUT_DIR,f"student_ep{ep:03d}.pth"))
-#     print("✅ Scene→Event Scheme B PreHook版训练完成")
-#
-# if __name__ == "__main__":
-#     main()
-
-#
-# # scene2event_train.py
-# import os, torch, argparse
-# from tqdm import tqdm
-# from torch import nn
-# from torch.utils.data import DataLoader, Subset
-# from collections import defaultdict
-# import torch.nn.functional as F
-#
-# # ======= Dependences =======
-# from model.backbone.RelationNet import LocalUncertaintyAwareGraphAttentionLite
-# from model.detector.event_detector import FrameWiseHead
-# from model.discriminator.discriminator import TemporalDiscriminator
-# from dataset.movienet.load_movienet_server import load_data
-# from dataset.kinetics.dataset import build as build_kinetics, collate_fn
-# from tool.warmup_lr import warmup_decay_cosine
-#
-# # ======= Config =======
-# DEVICE = "cuda:5"
-# GPU = 5
-# EPOCHS = 10
-# BATCH_SIZE = 128
-# T = 21
-# LR = 1e-4
-# ALPHA_FEAT = 0.5
-# LAMBDA_ADV = 0.1
-# EVENT_KEEP_RATIO = 0.7
-# SCENE_KEEP_RATIO = 0.3
-#
-# OUT_DIR = "/home/tianxiaoxuan/data/mamba/checkpoint_sceneWithCL"
-# os.makedirs(OUT_DIR, exist_ok=True)
-# CKPT_SCENE = "/home/tianxiaoxuan/data/mamba/checkpoint_scene/epoch_004.pt"
-#
-# IMG_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl'
-# PLC_PATH = '/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl'
-# LABEL_PATH = '/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl'
-# SPLIT_PATH_SCENE = '/home/tianxiaoxuan/data/mamba/data/split318.json'
-# MAMBA_PATH = '/home/tianxiaoxuan/data/mamba/data/ImageNet_shot.pkl'
-# KINETICS_PATH = {
-#     "feature_path": "/data/shared_dataset/Kinetics/features",
-#     "annotation_path": "/data/shared_dataset/Kinetics/data",
-#     "score_path": "/data/shared_dataset/Kinetics/data",
-# }
-#
-# # ======= Load utils =======
-# def extract_state_dict(ckpt):
-#     if isinstance(ckpt, dict):
-#         for key in ("model_state_dict", "state_dict", "model"):
-#             if key in ckpt:
-#                 return ckpt[key]
-#     return ckpt
-#
-# def strip_module_prefix(sd: dict):
-#     return {k[len("module."):] if k.startswith("module.") else k:v for k,v in sd.items()}
-#
-# def load_backbone_only(model: nn.Module, ckpt_path: str, detector_prefix="detector."):
-#     ckpt = torch.load(ckpt_path, map_location="cpu")
-#     sd = strip_module_prefix(extract_state_dict(ckpt))
-#     pruned = {k:v for k,v in sd.items() if not k.startswith(detector_prefix)}
-#     res = model.load_state_dict(sd, strict=False)
-#     print("Backbone loaded:", len(pruned), "params.")
-#     return res
-#
-# # ======= Hook =======
-# class EncoderPreHook:
-#     def __init__(self, model_with_head):
-#         self.z = None
-#         def pre_hook(m, inp):
-#             z = inp[0]
-#             self.z = z.mean(dim=1) if z.dim()==3 else z
-#         self.h = model_with_head.detector.register_forward_pre_hook(lambda m,i: pre_hook(m,i))
-#     def close(self): self.h.remove()
-#
-# # ======= Build models =======
-# def build_teacher(scene_ckpt, device=DEVICE):
-#     teacher = LocalUncertaintyAwareGraphAttentionLite(
-#         dim_in=2048, num_heads=8, window_size=5, sim_temperature=0.07,
-#         neighbor_temp=0.5, uncertainty_mode="variance",
-#         use_relative_pos_bias=True, norm="ln", size=T
-#     ).to(device)
-#     load_backbone_only(teacher, scene_ckpt)
-#     for p in teacher.parameters(): p.requires_grad_(False)
-#     teacher.eval()
-#     teacher.detector = nn.Identity().to(device)
-#     hook = EncoderPreHook(teacher)
-#     print("Teacher(Scene) encoder loaded.")
-#     return teacher, hook, 2176
-#
-# def build_student(device=DEVICE):
-#     student = LocalUncertaintyAwareGraphAttentionLite(
-#         dim_in=2048, num_heads=8, window_size=5, sim_temperature=0.07,
-#         neighbor_temp=0.5, uncertainty_mode="variance",
-#         use_relative_pos_bias=True, norm="ln", size=T
-#     ).to(device)
-#     student.detector = FrameWiseHead(in_features=2176).to(device)
-#     hook = EncoderPreHook(student)
-#     print("Student(Event head) initialized.")
-#     return student, hook, 2176
-#
-# # ======= Grad Reverse =======
-# class GradReverse(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx, x, lambd): ctx.lambd = lambd; return x.view_as(x)
-#     @staticmethod
-#     def backward(ctx, grad_output): return -ctx.lambd * grad_output, None
-# def grad_reverse(x, lambd=1.0): return GradReverse.apply(x, lambd)
-#
-# # ======= Dataloaders =======
-# def build_subset_loader_event(keep,batch,seg,device):
-#     args = argparse.Namespace(feature_path=KINETICS_PATH["feature_path"],
-#                               annotation_path=KINETICS_PATH["annotation_path"],
-#                               score_path=KINETICS_PATH["score_path"],
-#                               window_size=seg, interval=1, device=device)
-#     ds = build_kinetics(split='train', args=args)
-#     import random
-#     N = len(ds); keep = max(1,int(N*keep))
-#     sub = Subset(ds, torch.randperm(N)[:keep].tolist())
-#     return DataLoader(sub,batch_size=batch,shuffle=True,collate_fn=collate_fn,
-#                       num_workers=4,pin_memory=True,drop_last=True)
-#
-# def build_subset_loader_scene(split,keep,batch,seg):
-#     full = load_data(LABEL_PATH, IMG_PATH, PLC_PATH, MAMBA_PATH, split,
-#                      batch, seg_sz=seg, mode1='train', mode2=None)
-#     ds = full.dataset; N = len(ds); keep = max(1,int(N*keep))
-#     sub = Subset(ds, torch.randperm(N)[:keep].tolist())
-#     return DataLoader(sub,batch_size=batch,shuffle=True,num_workers=4,
-#                       pin_memory=True,drop_last=True)
-#
-# def paired_iter(a,b):
-#     ia,ib=iter(a),iter(b)
-#     while True:
-#         try: A=next(ia)
-#         except StopIteration: ia=iter(a); A=next(ia)
-#         try: B=next(ib)
-#         except StopIteration: ib=iter(b); B=next(ib)
-#         yield A,B
-#
-# # ======= Train SchemeB =======
-# def train_epoch_schemeB(loaderE, loaderS, student, stu_hook, teacher, tea_hook, disc,
-#                         optM, optD, schM=None, schD=None,
-#                         device=DEVICE, alpha_feat=ALPHA_FEAT, lambda_adv=LAMBDA_ADV):
-#     bce = nn.BCEWithLogitsLoss()
-#     it = paired_iter(loaderE, loaderS)
-#     pbar = tqdm(range(len(loaderE)), desc="Train SchemeB Scene→Event")
-#     for _ in pbar:
-#         batchE, batchS = next(it)
-#         loc, feat, tlist, *_ = batchE
-#         feat = feat.to(device)
-#         labelE = torch.tensor([1. if t['boundaries'].numel()>0 else 0. for t in tlist],
-#                               device=device)
-#
-#         _, imgS, plcS, _, labelS, *_ = batchS
-#         imgS, plcS = imgS.to(device), plcS.to(device)
-#         x_old = 0.7*imgS + 0.3*plcS
-#         x_new = feat
-#
-#         # 判别器
-#         optD.zero_grad(set_to_none=True)
-#         with torch.no_grad():
-#             _ = student(x_new); zE = stu_hook.z.detach()
-#             _ = student(x_old); zS = stu_hook.z.detach()
-#         z_dom = torch.cat([zS, zE], 0)
-#         y_dom = torch.cat([torch.zeros(len(zS),1,device=device),
-#                            torch.ones(len(zE),1,device=device)], 0)
-#         outD = disc(z_dom)
-#         lossD = F.binary_cross_entropy_with_logits(outD, y_dom)
-#         lossD.backward(); optD.step()
-#         if schD: schD.step()
-#
-#         # 主模型
-#         optM.zero_grad(set_to_none=True)
-#         scoreE, _ = student(x_new)
-#         loss_task = bce(scoreE.squeeze(), labelE)
-#
-#         with torch.no_grad():
-#             _ = teacher(x_new); zT = tea_hook.z
-#         _ = student(x_new); zS_new = stu_hook.z
-#         loss_feat = F.mse_loss(zS_new, zT)
-#
-#         _ = student(x_old); zS_old = stu_hook.z
-#         z_all = torch.cat([zS_old, zS_new], 0)
-#         y_all = torch.cat([torch.zeros(len(zS_old),1,device=device),
-#                            torch.ones(len(zS_new),1,device=device)], 0)
-#         out_adv = disc(grad_reverse(z_all,1.0))
-#         loss_adv = F.binary_cross_entropy_with_logits(out_adv, y_all)
-#         #
-#         # loss = loss_task + alpha_feat*loss_feat - lambda_adv*loss_adv
-#         loss = loss_task + alpha_feat * loss_feat
-#         loss.backward(); optM.step()
-#         if schM: schM.step()
-#
-#         pbar.set_postfix(task=loss_task.item(), feat=loss_feat.item(),
-#                          adv=loss_adv.item(), disc=lossD.item())
-#
-# def train_epoch_schemeA_mixed(loader_scene, loader_event,
-#                               student, stu_hook,
-#                               teacher, tea_hook,
-#                               disc,
-#                               opt_student, opt_disc,
-#                               sch_student=None, sch_disc=None,
-#                               device=DEVICE,
-#                               alpha_feat=ALPHA_FEAT,
-#                               lambda_adv=LAMBDA_ADV):
-#     """
-#     Scheme A: Scene(Event)混合批训练
-#     - Scene: 有 label → 任务监督 + 蒸馏
-#     - Event: 无 label → 仅对抗
-#     """
-#     student.train(); teacher.eval(); disc.train()
-#     bce = nn.BCEWithLogitsLoss()
-#
-#     it = paired_iter(loader_scene, loader_event)
-#     pbar = tqdm(range(len(loader_scene)), desc="Train SchemeA (Scene+Event mixed)")
-#
-#     for _ in pbar:
-#         batchS, batchE = next(it)
-#         # ------- Scene batch -------
-#         _, imgS, plcS, _, labelS, *_ = batchS
-#         imgS, plcS = imgS.to(device), plcS.to(device)
-#         labelS = labelS.float().to(device)
-#         x_scene = 0.7 * imgS + 0.3 * plcS
-#
-#         # ------- Event batch -------
-#         loc, feat, tlist, *_ = batchE
-#         feat = feat.to(device)
-#
-#         # ------- 更新判别器 -------
-#         opt_disc.zero_grad(set_to_none=True)
-#         with torch.no_grad():
-#             _ = student(x_scene); z_scene = stu_hook.z.detach()
-#             _ = student(feat);    z_event = stu_hook.z.detach()
-#         z_all = torch.cat([z_event, z_scene], 0)
-#         y_all = torch.cat([
-#             torch.zeros(len(z_event), 1, device=device),
-#             torch.ones(len(z_scene), 1, device=device)
-#         ], 0)
-#         outD = disc(z_all)
-#         lossD = F.binary_cross_entropy_with_logits(outD, y_all)
-#         lossD.backward(); opt_disc.step()
-#         if sch_disc: sch_disc.step()
-#
-#         # ------- 更新学生 -------
-#         opt_student.zero_grad(set_to_none=True)
-#
-#         # (1) Scene 任务监督
-#         out_scene, _ = student(x_scene)
-#         loss_task = bce(out_scene.squeeze(), labelS)
-#
-#         # (2) 特征蒸馏 (teacher(Scene) → student(Scene))
-#         with torch.no_grad():
-#             _ = teacher(x_scene); zT = tea_hook.z
-#         _ = student(x_scene); zS = stu_hook.z
-#         loss_feat = F.mse_loss(zS, zT)
-#
-#         # (3) 域对抗 (Scene vs Event)
-#         _ = student(feat); z_event_s = stu_hook.z
-#         z_domain = torch.cat([z_event_s, zS], 0)
-#         y_domain = torch.cat([
-#             torch.zeros(len(z_event_s), 1, device=device),
-#             torch.ones(len(zS), 1, device=device)
-#         ], 0)
-#         out_adv = disc(grad_reverse(z_domain, 1.0))
-#         loss_adv = F.binary_cross_entropy_with_logits(out_adv, y_domain)
-#
-#         # (4) 总损失 = 任务 + 蒸馏 − 对抗
-#         # loss = loss_task + alpha_feat * loss_feat - lambda_adv * loss_adv
-#         loss = loss_task + - lambda_adv * loss_adv
-#         loss.backward(); opt_student.step()
-#         if sch_student: sch_student.step()
-#
-#         pbar.set_postfix(task=loss_task.item(),
-#                          feat=loss_feat.item(),
-#                          adv=loss_adv.item(),
-#                          disc=lossD.item())
-#
-# from model.detector.scene_detector import MlpHead
-# # ======= MAIN =======
-# def main():
-#     teacher, tea_hook, _ = build_teacher(CKPT_SCENE, DEVICE)
-#     student, stu_hook, d_s = build_student(DEVICE)
-#     disc = TemporalDiscriminator(in_dim=d_s).to(DEVICE)
-#
-#     lE = build_subset_loader_event(EVENT_KEEP_RATIO, BATCH_SIZE, T, DEVICE)
-#     lS = build_subset_loader_scene(SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T)
-#
-#     optM = torch.optim.Adam(student.parameters(), lr=LR)
-#     optD = torch.optim.Adam(disc.parameters(), lr=LR)
-#     schM = torch.optim.lr_scheduler.LambdaLR(
-#         optM, warmup_decay_cosine(len(lE), len(lE)*EPOCHS)
-#     )
-#     schD = torch.optim.lr_scheduler.LambdaLR(
-#         optD, warmup_decay_cosine(len(lE), len(lE)*EPOCHS)
-#     )
-#
-#     for ep in range(EPOCHS):
-#         train_epoch_schemeB(lE, lS, student, stu_hook,
-#                             teacher, tea_hook, disc, optM, optD, schM, schD)
-#         ckpt_path = os.path.join(OUT_DIR, f"student_ep{ep:03d}.pth")
-#         torch.save({"model": student.state_dict(), "epoch": ep}, ckpt_path)
-#         print(f"✅ Saved checkpoint to {ckpt_path}")
-#     scene_head = MlpHead(in_dim=2176, hid_dim=512).to(f"cuda:{gpu}")
-#     for n, p in student.named_parameters():
-#         p.requires_grad = False
-#     student.detector = scene_head
-#     for p in student.detector.parameters():
-#         p.requires_grad = True
-#
-#     criterion = nn.BCEWithLogitsLoss()
-#     optimizer = torch.optim.Adam(student.detector.parameters(), lr=1e-4,
-#                                  betas=(0.9, 0.98), weight_decay=1e-4)
-#     total_steps = len() * epochs
-#     scheduler = torch.optim.lr_scheduler.LambdaLR(
-#         optimizer, lr_lambda=warmup_decay_cosine(len(scene_train_loader), total_steps))
-#
-#     for ep in range(1, epochs + 1):
-#         train_one_epoch(scene_train_loader, model, optimizer, scheduler, criterion, gpu=gpu, epoch=ep)
-#         scene_metrics = evaluate_scene(scene_test_loader, model, gpu=gpu)
-#         print(f"\n[Scene Eval after Epoch {ep}] Metrics: {scene_metrics}")
-#
-#     print("\n✅ Training + Evaluation Pipeline Completed.")
-# # def main():
-# #     teacher, tea_hook, _ = build_teacher(CKPT_SCENE, DEVICE)
-# #     student, stu_hook, d_s = build_student(DEVICE)
-# #     disc = TemporalDiscriminator(in_dim=d_s).to(DEVICE)
-# #
-# #     loader_event = build_subset_loader_event(EVENT_KEEP_RATIO, BATCH_SIZE, T, DEVICE)
-# #     loader_scene = build_subset_loader_scene(SPLIT_PATH_SCENE, SCENE_KEEP_RATIO, BATCH_SIZE, T)
-# #
-# #     opt_student = torch.optim.Adam(student.parameters(), lr=LR)
-# #     opt_disc = torch.optim.Adam(disc.parameters(), lr=LR)
-# #
-# #     sch_student = torch.optim.lr_scheduler.LambdaLR(
-# #         opt_student, warmup_decay_cosine(len(loader_scene), len(loader_scene)*EPOCHS)
-# #     )
-# #     sch_disc = torch.optim.lr_scheduler.LambdaLR(
-# #         opt_disc, warmup_decay_cosine(len(loader_scene), len(loader_scene)*EPOCHS)
-# #     )
-# #
-# #     for ep in range(EPOCHS):
-# #         train_epoch_schemeA_mixed(loader_scene, loader_event,
-# #                                   student, stu_hook,
-# #                                   teacher, tea_hook,
-# #                                   disc,
-# #                                   opt_student, opt_disc,
-# #                                   sch_student, sch_disc)
-# #         ckpt_path = os.path.join(OUT_DIR, f"student_ep{ep:03d}.pth")
-# #         torch.save({"model": student.state_dict(), "epoch": ep}, ckpt_path)
-# #         print(f"✅ Saved checkpoint to {ckpt_path}")
-# #
-# # import os
-# # import argparse
-# # from collections import defaultdict
-# # import torch
-# # from torch import nn
-# # import numpy as np
-# # from tqdm import tqdm
-# # from torch.utils.data import DataLoader
-# #
-# # # ===== 模型与工具依赖 =====
-# # from model.backbone.RelationNet import LocalUncertaintyAwareGraphAttentionLite
-# # from model.detector.scene_detector import MlpHead
-# # from dataset.kinetics.dataset import build as build_kinetics, collate_fn
-# # from dataset.movienet.load_movienet_server import load_data
-# # from tool.warmup_lr import warmup_decay_cosine
-# # from tool.metric.scene_metric import metric as scene_metric
-# # # ===============================================================
-# # # Scene Head 训练 & 评估
-# # # ===============================================================
-# # def train_one_epoch(scene_loader, model, optimizer, scheduler, criterion, gpu=0, epoch=1):
-# #     """scene_head 单次训练(一轮)"""
-# #     model.train().cuda(gpu)
-# #     epoch_loss = 0.0
-# #     for batch_idx, batch in enumerate(tqdm(scene_loader, desc=f"🎯 Train Scene Epoch {epoch}")):
-# #         names, img_ctx, plc_ctx, label, pos, ids, ind = batch = batch
-# #         img_ctx, plc_ctx, label = img_ctx.cuda(gpu), plc_ctx.cuda(gpu), label.float().cuda(gpu)
-# #
-# #         optimizer.zero_grad()
-# #         x = 0.7 * img_ctx + 0.3 * plc_ctx
-# #         logtics, pred = model(x)
-# #         loss = criterion(logtics.squeeze(), label)
-# #         loss.backward()
-# #         optimizer.step()
-# #         scheduler.step()
-# #         epoch_loss += loss.item()
-# #
-# #     avg_loss = epoch_loss / len(scene_loader)
-# #     lr = scheduler.get_last_lr()[0]
-# #     print(f"[Scene Train] Epoch {epoch}: Loss={avg_loss:.4f}, LR={lr:.6f}")
-# #     return avg_loss
-# #
-# #
-# # @torch.no_grad()
-# # def evaluate_scene(scene_loader, model, gpu=0):
-# #     """Scene Head 推理并计算 metric"""
-# #     model.eval().cuda(gpu)
-# #     predlist, labelist, pathlist = [], [], []
-# #     for batch in tqdm(scene_loader, desc="Scene Eval"):
-# #         names, img_ctx, plc_ctx, label, pos, ids, ind = batch = batch
-# #         img_ctx, plc_ctx = img_ctx.cuda(gpu), plc_ctx.cuda(gpu)
-# #         x = 0.7 * img_ctx + 0.3 * plc_ctx
-# #         _, pred = model(x)
-# #         predlist.append(pred.cpu().numpy())
-# #         labelist.append(label.numpy())
-# #         pathlist.append(names)
-# #     met, moviePL = scene_metric(pathlist, predlist, labelist)
-# #     return met
-# #
-# # # ===============================================================
-# # # 主程序
-# # # ===============================================================
-# # def main():
-# #     gpu = 5
-# #     ckpt_path = "/home/tianxiaoxuan/data/mamba/checkpoint_event_BNA/checkpoint_event_BNA/ckpt_ep0.pth"
-# #     feature_path = "/data/shared_dataset/Kinetics/features"
-# #     anno_path = "/data/shared_dataset/Kinetics/data"
-# #     img_path = "/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/ImageNet_shot.pkl"
-# #     plc_path = "/data/shared_dataset/shared_dataset/MovieDatasets/MovieNet/Places_shot.pkl"
-# #     label_path = "/home/tianxiaoxuan/data/mamba/data/label_endShot.pkl"
-# #     split_path = "/home/tianxiaoxuan/data/mamba/data/split318.json"
-# #     mamba_path = "/home/tianxiaoxuan/data/mamba/data/ImageNet_shot.pkl"
-# #     window_size = 21
-# #     epochs = 10
-# #
-# #     # ==== 加载主干 ====
-# #     print(f"\n🚀 Loading checkpoint: {ckpt_path}")
-# #     model = LocalUncertaintyAwareGraphAttentionLite(
-# #         dim_in=2048, num_heads=8, window_size=5,
-# #         sim_temperature=0.07, neighbor_temp=0.5,
-# #         uncertainty_mode="variance", use_relative_pos_bias=True,
-# #         norm="ln", size=window_size,
-# #     ).to(f"cuda:{gpu}")
-# #     ckpt = torch.load(ckpt_path, map_location="cpu")
-# #     if isinstance(ckpt, dict) and "model" in ckpt:
-# #         state_dict = ckpt["model"]
-# #     else:
-# #         state_dict = ckpt  # 纯 state_dict
-# #
-# #     msg = model.load_state_dict(state_dict, strict=False)
-# #     print("checkpoint loaded:", msg)
-# #     model.load_state_dict(ckpt, strict=False)
-# #     print("✅ Loaded backbone and pre-trained event detector from checkpoint.")
-# #
-# #     # ==== 构建数据 ====
-# #     scene_train_loader = load_data(label_path, img_path, plc_path, split_path,
-# #                                    batch=128, seg_sz=window_size, mode1="train", mode2=None)
-# #     scene_test_loader = load_data(label_path, img_path, plc_path, split_path,
-# #                                   batch=128, seg_sz=window_size, mode1="test", mode2=None)
-# #
-# #     # =======================================================
-# #     # 2️⃣ Scene Head fine-tune & evaluate each epoch
-# #     # =======================================================
-# #     print("\n🎞 Fine-tuning Scene Head ...")
-# #     scene_head = MlpHead(in_dim=2176, hid_dim=512).to(f"cuda:{gpu}")
-# #     for n, p in model.named_parameters():
-# #         p.requires_grad = False
-# #     model.detector = scene_head
-# #     for p in model.detector.parameters():
-# #         p.requires_grad = True
-# #
-# #     criterion = nn.BCEWithLogitsLoss()
-# #     optimizer = torch.optim.Adam(model.detector.parameters(), lr=1e-4,
-# #                                  betas=(0.9, 0.98), weight_decay=1e-4)
-# #     total_steps = len(scene_train_loader) * epochs
-# #     scheduler = torch.optim.lr_scheduler.LambdaLR(
-# #         optimizer, lr_lambda=warmup_decay_cosine(len(scene_train_loader), total_steps))
-# #
-# #     for ep in range(1, epochs + 1):
-# #         train_one_epoch(scene_train_loader, model, optimizer, scheduler, criterion, gpu=gpu, epoch=ep)
-# #         scene_metrics = evaluate_scene(scene_test_loader, model, gpu=gpu)
-# #         print(f"\n[Scene Eval after Epoch {ep}] Metrics: {scene_metrics}")
-# #
-# #     print("\n✅ Training + Evaluation Pipeline Completed.")
-# #
-# #     # =======================================================
-# #     # 2️⃣ Scene Head fine-tune & evaluate each epoch
-# #     # =======================================================
-# #     print("\n🎞 Fine-tuning Scene Head ...")
-# #     scene_head = MlpHead(in_dim=2176, hid_dim=512).to(f"cuda:{gpu}")
-# #     for n, p in model.named_parameters():
-# #         p.requires_grad = False
-# #     model.detector = scene_head
-# #     for p in model.detector.parameters():
-# #         p.requires_grad = True
-# #
-# #     criterion = nn.BCEWithLogitsLoss()
-# #     optimizer = torch.optim.Adam(model.detector.parameters(), lr=1e-4,
-# #                                  betas=(0.9, 0.98), weight_decay=1e-4)
-# #     total_steps = len(scene_train_loader) * epochs
-# #     scheduler = torch.optim.lr_scheduler.LambdaLR(
-# #         optimizer, lr_lambda=warmup_decay_cosine(len(scene_train_loader), total_steps))
-# #
-# #     for ep in range(1, epochs + 1):
-# #         train_one_epoch(scene_train_loader, model, optimizer, scheduler, criterion, gpu=gpu, epoch=ep)
-# #         scene_metrics = evaluate_scene(scene_test_loader, model, gpu=gpu)
-# #         print(f"\n[Scene Eval after Epoch {ep}] Metrics: {scene_metrics}")
-# #
-# #     print("\n✅ Training + Evaluation Pipeline Completed.")
-# #
-# #
-# # if __name__ == "__main__":
-# #     main()
-# #

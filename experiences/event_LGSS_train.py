@@ -209,7 +209,7 @@ def save_json(data, json_path):
 
 def main():
     # 创建参数对象
-    kinetics_dataset_path = "/root/autodl-tmp/Kinetics/"
+    kinetics_dataset_path = "/data/Kinetics/"
     args = argparse.Namespace()
     args.feature_path = kinetics_dataset_path + "features"
     args.score_path = kinetics_dataset_path + "data"
@@ -217,7 +217,7 @@ def main():
     args.window_size = 21
     args.interval = 1
     args.device = 'cuda:0'
-    args.output_dir = '/root/autodl-fs/LGSS/event'
+    args.output_dir = '<output_dir>'
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1) 构建数据

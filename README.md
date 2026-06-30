@@ -66,7 +66,7 @@ eval
 
 **Scene → Event**
 
-| Method | Eval on scene| Eval on Event |
+| Method | | | |  | | |
 |--------|--|--|--|--|--|--|
 | | mAP | mIoU | F1 | F1@0.05 | F1@0.10 | Avg F1 (0.05~0.50) |
 | EWC (PNAS'17) | 31.2 | 25.5 | 35.0 | 51.9 | 65.0 | 64.6 |
@@ -76,7 +76,7 @@ eval
 
 **Event → Scene**
 
-| Method | Eval on Event | | | Eval on Scene | | |
+| Method | | | | | | |
 |--------|--|--|--|--|--|--|
 | | F1@0.05 | F1@0.10 | Avg F1 (0.05~0.50) | mAP | mIoU | F1 |
 | EWC (PNAS'17) | 39.3 | 43.7 | 44.0 | 35.9 | 27.2 | 36.6 |
@@ -86,7 +86,7 @@ eval
 
 ### Only Encoder Results
 
-| Method | | MovieNet (Scene) | | | Kinetics-GEBD (Event) | |
+| Method | | | | | | |
 |--------|--|--|--|--|--|--|
 | | mAP | mIoU | F1 | F1@0.05 | F1@0.10 | Avg F1 (0.05~0.50) |
 | **Method originally designed for scene boundary detection** | | | | | | |

@@ -193,13 +193,13 @@ def test_epoch(testload, model, gpu=0):
 def main():
     # 创建参数对象
     args = argparse.Namespace()
-    args.feature_path = "/data/shared_dataset/Kinetics/features"
-    args.score_path = "/data/shared_dataset/Kinetics/data"
-    args.annotation_path = "/data/shared_dataset/Kinetics/data"
+    args.feature_path = "</Kinetics/features>"
+    args.score_path = "</Kinetics/data>"
+    args.annotation_path = "</Kinetics/data>"
     args.window_size = 21
     args.interval = 1
     args.device = 'cuda:0'
-    args.output_dir = '/home/tianxiaoxuan/data/mamba/checkpoint_event_withoutLocalwithoutD'
+    args.output_dir = '<output_dir>'
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1) 构建数据

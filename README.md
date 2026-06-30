@@ -18,13 +18,15 @@ Then use the following command to install dependencies.
 
 Please follow the instructions in the repositories below to prepare the datasets:
 
-**Movienet**：[https://github.com/mini-mind/VSMBD](https://github.com/mini-mind/VSMBD)
+**MovieNet**：[https://github.com/mini-mind/VSMBD](https://github.com/mini-mind/VSMBD)
 
 then you should obtain the following files:
 
 ```
 ImageNet_shot.pkl
 Places_shot.pkl
+label_endShot.pkl
+split318.json
 ```
 
 **Kinetics-GEBD**: [https://github.com/MCG-NJU/TemporalPerceiver](https://github.com/MCG-NJU/TemporalPerceiver)
@@ -33,11 +35,12 @@ then you should obtain the following files:
 
 ```
 features
+data
 k400_mr345_train_min_change_duration0.3.pkl
 k400_mr345_val_min_change_duration0.3.pkl
 ```
 
-After preparation, place the data under the `data/Movienet` and `data/Kinetics` directory (or update the path in the config file accordingly).
+After preparation, place the data under the `data/MovieNet` and `data/Kinetics` directory (or update the path in the config file accordingly).
 
 ## Usage
 

@@ -66,7 +66,7 @@ eval
 
 **Scene → Event**
 
-| Method | Eval |on| scene| Eval on Event | | |
+| Method | Eval on scene| Eval on Event |
 |--------|--|--|--|--|--|--|
 | | mAP | mIoU | F1 | F1@0.05 | F1@0.10 | Avg F1 (0.05~0.50) |
 | EWC (PNAS'17) | 31.2 | 25.5 | 35.0 | 51.9 | 65.0 | 64.6 |

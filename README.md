@@ -116,9 +116,11 @@ train with PC method
 `python ./experiences/event_PC_train.py`
 
 ## Citation
+```
 @inproceedings{tian2026temporal,
   title     = {Multi-Type Incremental Local-to-Global Context Encoder for Video Boundary Detection},
   author    = {Xiaoxuan Tian, Ruifan Zhao, Zhilong Ou, and Hongxing Wang},
   booktitle = {International Joint Conference on Neural Networks (IJCNN)},
   year      = {2026}
 }
+```

@@ -71,14 +71,14 @@ password: iqx4
 ![table1](images/table1.png)
 
 ### Only Encoder Results
-![table2](images/table2.png)
+![only_encoder](images/only_encoder.png)
 
 ‡ indicates methods evaluated using the same feature inputs as ours.
 
 ### Ablation Study
 
 Effect of each proposed module (LE = Local Encoder, GE = Global Encoder, D = Discriminator).
-![only_encoder](images/only_encoder.png)
+![table2](images/table2.png)
 
 ## Citation
 ```

@@ -27,7 +27,7 @@ ImageNet_shot.pkl
 Places_shot.pkl
 ```
 
-**Kinetics-GEBD**:[https://github.com/MCG-NJU/TemporalPerceiver](https://github.com/MCG-NJU/TemporalPerceiver)
+**Kinetics-GEBD**: [https://github.com/MCG-NJU/TemporalPerceiver](https://github.com/MCG-NJU/TemporalPerceiver)
 
 then you should obtain the following files:
 
@@ -51,7 +51,7 @@ train without incremental learning
 
 train with incremental learning
 
-`python event2sceneWithCL.py`
+`python event2sceneWithCL.py` 
 
 `python scene2eventWithCL.py`
 
@@ -60,6 +60,9 @@ eval
 `python event_eval.py`
 
 `python scene_eval.py`
+
+**best_checkpoint** : [best_checkpoint](https://pan.baidu.com/s/1ZSfTRRzw9dmxal6brtKBWw?pwd=iqx4) 
+password: iqx4
 
 ## Results
 ### WIth Incremental Learning Results

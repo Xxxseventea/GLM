@@ -41,7 +41,7 @@ After preparation, place the data under the `data/` directory (or update the pat
 
 ## Usage
 
-**our method**
+**Our method**
 
 train without incremental learning
 
@@ -70,7 +70,7 @@ password: iqx4
 
 ![table1](images/table1.png)
 
-### Only Encoder Results
+### Results on Scene & Event Boundary Detection
 ![only_encoder](images/only_encoder.png)
 
 ‡ indicates methods evaluated using the same feature inputs as ours.

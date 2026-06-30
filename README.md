@@ -37,7 +37,7 @@ k400_mr345_train_min_change_duration0.3.pkl
 k400_mr345_val_min_change_duration0.3.pkl
 ```
 
-After preparation, place the data under the `data/` directory (or update the path in the config file accordingly).
+After preparation, place the data under the `data/Movienet` and `data/Kinetics` directory (or update the path in the config file accordingly).
 
 ## Usage
 

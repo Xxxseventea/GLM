@@ -25,15 +25,15 @@ T = 20
 GPU = 0
 
 # 路径
-movienet_path = "/mnt/MovieNet/"
+movienet_path = "data/MovieNet/"
 IMG_PATH = movienet_path + 'ImageNet_shot.pkl'
 PLC_PATH = movienet_path + 'Places_shot.pkl'
 LABEL_PATH = movienet_path + 'label_endShot.pkl'
 SPLIT_PATH = movienet_path + 'split318.json'
 MAMBA_PATH = movienet_path + 'ImageNet_shot.pkl'
 
-CKPT_DIR = '/root/autodl-fs/LGSS'
-SIDE_DIR = '/root/autodl-fs/LGSS/side_outputs'
+CKPT_DIR = '<weight/checkpoint.pt>'
+SIDE_DIR = '<side_outputs>'
 os.makedirs(CKPT_DIR, exist_ok=True)
 os.makedirs(SIDE_DIR, exist_ok=True)
 import torch

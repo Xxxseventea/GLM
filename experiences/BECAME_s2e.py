@@ -70,16 +70,16 @@ CFG = {
     'use_distill':       True,
     'distill_coef':      1.0,
 
-    'kinetics_dataset_path': '/root/autodl-tmp/Kinetics/',
+    'kinetics_dataset_path': 'data/Kinetics/',
     'kinetics_data': 'data',
-    'movienet_dataset_path': '/mnt/MovieNet/',
+    'movienet_dataset_path': 'data/MovieNet/',
     'split_path': 'split318.json',
     'modalA_path': 'ImageNet_shot.pkl',
     'modalB_path': 'Places_shot.pkl', 
     'seg_sz': 20,
     'label_path': 'label_endShot.pkl',
     'task_order': ['scene', 'event'],   # 先scene再event
-    'save_path': '/root/autodl-fs/became/scene2event'
+    'save_path': '<save_dir>'
 }
 
 def parse_args():

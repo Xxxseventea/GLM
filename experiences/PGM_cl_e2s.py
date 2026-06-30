@@ -719,10 +719,10 @@ if __name__ == '__main__':
     parser.add_argument('--debug_test_samples', type=int, default=32,
                         help='debug 模式下，每个任务测试用多少样本')
     parser.add_argument('--debug_epochs', type=int, default=1)
-    # parser.add_argument('--feature_path', type=str, default='./data/gebd/features')
-    # parser.add_argument('--score_path', type=str, default='./data/gebd/scores')
-    # parser.add_argument('--annotation_path', type=str, default='./data/gebd/anno.json')
-    # parser.add_argument('--movienet_path', type=str, default='./data/movienet')
+    # parser.add_argument('--feature_path', type=str, default='data/Kinetics/features')
+    # parser.add_argument('--score_path', type=str, default='data/Kinetics/scores')
+    # parser.add_argument('--annotation_path', type=str, default='data/Kinetics/anno.json')
+    # parser.add_argument('--movienet_path', type=str, default='data/Movienet')
 
     parser.add_argument('--save_path', type=str, default='/root/autodl-fs/PGM/event2scene')
     args = parser.parse_args()

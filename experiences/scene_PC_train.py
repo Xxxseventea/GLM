@@ -25,7 +25,7 @@ T = 20
 GPU = 0
 
 # 路径
-movienet_path = "/MovieNet/"
+movienet_path = "data/MovieNet/"
 IMG_PATH = movienet_path + 'ImageNet_shot.pkl'
 PLC_PATH = movienet_path + 'Places_shot.pkl'
 LABEL_PATH = movienet_path + 'label_endShot.pkl'

@@ -40,8 +40,8 @@ GPU = 0
 DEVICE = f"cuda:{GPU}"
 
 
-movienet_dataset_path = "/mnt/MovieNet/"
-kinetics_dataset_path = "/root/autodl-tmp/Kinetics/"
+movienet_dataset_path = "data/MovieNet/"
+kinetics_dataset_path = "data/Kinetics/"
 IMG_PATH         = movienet_dataset_path + 'ImageNet_shot.pkl'
 PLC_PATH         = movienet_dataset_path + 'Places_shot.pkl'
 LABEL_PATH       = movienet_dataset_path + 'label_endShot.pkl'
@@ -49,7 +49,7 @@ SPLIT_PATH_SCENE = movienet_dataset_path + 'split318.json'
 MAMBA_PATH       = IMG_PATH
 
 # 输出目录：scene-first + WithCL_L_G 实验,放到 autodl-fs
-CKPT_DIR = '/root/autodl-fs/mamba/checkpoint_scene/SceneFirst_WithCL_L_G'
+CKPT_DIR = '<checkpoint_dir>'
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # Phase 1 超参

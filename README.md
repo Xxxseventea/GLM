@@ -74,7 +74,7 @@ eval
 ### Ablation Study
 
 Effect of each proposed module (LE = Local Encoder, GE = Global Encoder, D = Discriminator).
-![only encoder](images/only encoder.png)
+![only_encoder](images/only encoder.png)
 
 ## Citation
 ```
